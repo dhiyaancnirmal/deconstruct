@@ -37,9 +37,9 @@ func Profiles() []Profile {
 	return []Profile{
 		{ID: "standard", Name: "Standard replay", Mode: "http_client", Description: "Fast local replay through the Go HTTP client.", Visibility: "request_response", Fidelity: "normal", Protocols: []string{"http1", "http2"}},
 		{ID: "browser", Name: "Browser replay", Mode: "browser", Description: "Replay through a browser-controlled network stack.", Visibility: "browser_observed", Fidelity: "highest", Protocols: []string{"http1", "http2", "websocket", "sse"}},
-		{ID: "utls", Name: "uTLS replay", Mode: "utls", Description: "Replay with selectable ClientHello-style profiles.", Visibility: "request_response", Fidelity: "high", Protocols: []string{"http1", "http2"}},
-		{ID: "curl_impersonate", Name: "curl-impersonate replay", Mode: "external", Description: "Adapter profile for browser-like TLS and HTTP handshakes.", Visibility: "request_response", Fidelity: "high", Protocols: []string{"http1", "http2"}},
-		{ID: "passthrough", Name: "Passthrough validation", Mode: "metadata_only", Description: "Validate flow structure without decrypting or replaying sensitive endpoints.", Visibility: "metadata", Fidelity: "original_client"},
+		{ID: "utls", Name: "uTLS replay", Mode: "utls", Description: "Executes HTTPS requests through uTLS with selectable browser ClientHello profiles.", Visibility: "request_response", Fidelity: "high", Protocols: []string{"http1"}},
+		{ID: "curl_impersonate", Name: "curl-impersonate replay", Mode: "external", Description: "Executes requests through a curl-impersonate compatible binary.", Visibility: "request_response", Fidelity: "high", Protocols: []string{"http1", "http2"}},
+		{ID: "passthrough", Name: "Passthrough validation", Mode: "metadata_only", Description: "Records a validation run without sending a replay request to sensitive or pinned endpoints.", Visibility: "metadata", Fidelity: "original_client"},
 	}
 }
 

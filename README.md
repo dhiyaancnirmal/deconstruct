@@ -23,6 +23,7 @@ This repository currently scopes implementation to the backend:
 - encrypted local auth vault and auth profile persistence with cookie-warming metadata
 - generated TypeScript/Python projects, OpenAPI 3.1, Postman collections, and Dockerfiles
 - local MCP HTTP endpoint for resources, tools, and prompts
+- real replay adapters for standard HTTP, uTLS, CDP browser fetch, curl-impersonate executables, and passthrough validation
 - replay fidelity profiles and diagnostics
 - SSE, gRPC/gRPC-web, and protobuf inspection tags
 - `.deconstruct` bundle/schema naming

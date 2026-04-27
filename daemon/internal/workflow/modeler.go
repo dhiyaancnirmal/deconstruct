@@ -34,11 +34,13 @@ type SuggestParams struct {
 }
 
 type RunParams struct {
-	WorkflowID    string            `json:"workflow_id"`
-	Inputs        map[string]any    `json:"inputs,omitempty"`
-	DryRun        bool              `json:"dry_run,omitempty"`
-	AuthProfileID string            `json:"auth_profile_id,omitempty"`
-	AuthMaterial  map[string]string `json:"-"`
+	WorkflowID     string            `json:"workflow_id"`
+	Inputs         map[string]any    `json:"inputs,omitempty"`
+	DryRun         bool              `json:"dry_run,omitempty"`
+	AuthProfileID  string            `json:"auth_profile_id,omitempty"`
+	ReplayProfile  string            `json:"replay_profile,omitempty"`
+	ProfileOptions map[string]string `json:"profile_options,omitempty"`
+	AuthMaterial   map[string]string `json:"-"`
 }
 
 func NewBuilder(store Store, blobs *blobstore.Store) *Builder {
@@ -161,7 +163,13 @@ func (b *Builder) Run(ctx context.Context, workflow store.Workflow, params RunPa
 			break
 		}
 		applyAuthMaterial(&overrides, params.AuthMaterial)
-		result, err := engine.Run(ctx, replay.Params{FlowID: step.FlowID, Overrides: overrides, DryRun: params.DryRun})
+		profile := params.ReplayProfile
+		profileOptions := params.ProfileOptions
+		if step.ReplayProfile != "" {
+			profile = step.ReplayProfile
+			profileOptions = step.ProfileOptions
+		}
+		result, err := engine.Run(ctx, replay.Params{FlowID: step.FlowID, Overrides: overrides, DryRun: params.DryRun, Profile: profile, ProfileOptions: profileOptions})
 		if err != nil {
 			run.OK = false
 			run.Error = err.Error()

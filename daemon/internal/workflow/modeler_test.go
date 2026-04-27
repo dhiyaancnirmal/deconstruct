@@ -106,6 +106,48 @@ func TestSuggestExcludesStaticAsset(t *testing.T) {
 	}
 }
 
+func TestRunUsesStepReplayProfile(t *testing.T) {
+	db, blobs := testDeps(t)
+	ctx := context.Background()
+	if err := db.EnsureSession(ctx, store.Session{ID: "session_1", Name: "Capture", Kind: "capture", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertFlow(ctx, store.Flow{
+		ID:              "flow_passthrough",
+		SessionID:       "session_1",
+		Method:          "GET",
+		URL:             "https://pinned.example.test",
+		Host:            "pinned.example.test",
+		Status:          http.StatusOK,
+		RequestHeaders:  []byte(`{}`),
+		ResponseHeaders: []byte(`{}`),
+		CreatedAt:       time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	workflow := store.Workflow{
+		ID:   "workflow_passthrough",
+		Name: "Pinned validation",
+		Steps: []store.WorkflowStep{{
+			ID:            "step_1",
+			FlowID:        "flow_passthrough",
+			Included:      true,
+			ReplayProfile: "passthrough",
+			Assertions:    store.WorkflowAssertions{Status: []int{http.StatusNoContent}},
+		}},
+	}
+	if err := db.SaveWorkflow(ctx, workflow); err != nil {
+		t.Fatal(err)
+	}
+	run, err := NewBuilder(db, blobs).Run(ctx, workflow, RunParams{WorkflowID: workflow.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !run.OK || len(run.StepRuns) != 1 || run.StepRuns[0].Status != http.StatusNoContent {
+		t.Fatalf("unexpected passthrough run: %#v", run)
+	}
+}
+
 func testDeps(t *testing.T) (*store.Store, *blobstore.Store) {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "test.sqlite3"))

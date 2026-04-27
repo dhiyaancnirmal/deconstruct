@@ -120,8 +120,17 @@ Replay v1 can execute a captured request with optional edits:
 - dry-run preparation without network execution
 - retry on network errors or server errors
 - A/B variation runs over different overrides
+- replay profile selection through `profile` / `replay_profile`
 
-Each replay execution is recorded as a `replay_runs` row and, when a response is received, as a normal replay flow in the `Replay runs` session. Use `flows.compare` with the original flow id and replay flow id to inspect original-vs-replay differences.
+Each replay execution is recorded as a `replay_runs` row and, when a response is received, as a normal replay flow in the `Replay runs` session. Replay flows are tagged with `replay_profile:<profile>`. Use `flows.compare` with the original flow id and replay flow id to inspect original-vs-replay differences.
+
+Replay profiles:
+
+- `standard`: Go HTTP client replay.
+- `utls`: real HTTPS replay through uTLS with selectable ClientHello profiles via `profile_options.hello`, for example `chrome`, `firefox`, `safari`, `ios`, `android`, `edge`, or `random`.
+- `curl_impersonate`: real external execution through a curl-impersonate-compatible binary. Use `profile_options.binary` to point at a bundled or installed executable.
+- `browser`: real CDP browser replay. Use `profile_options.cdp_url`, defaulting to `http://127.0.0.1:9222`; the browser sends the request through `fetch` with `credentials: "include"`.
+- `passthrough`: records a validation run without replaying the sensitive/pinned endpoint.
 
 `flows.export_script` currently supports `typescript` and `python` one-request exports. Like cURL export, generated scripts redact obvious secrets by default.
 
@@ -136,7 +145,7 @@ The deterministic workflow compiler can draft a workflow from selected captured 
 - included steps get status assertions based on the original response
 - simple JSON body inputs are represented as `${input.name}` templates in step replay overrides
 
-`workflows.run` executes included steps sequentially through the replay engine and records a workflow run with per-step replay run IDs, statuses, and errors. Steps can receive input templating and auth profile material from the local vault.
+`workflows.run` executes included steps sequentially through the replay engine and records a workflow run with per-step replay run IDs, statuses, and errors. Steps can receive input templating, auth profile material from the local vault, and step-level or run-level replay profiles.
 
 ## Auth Chain Tracing
 
@@ -189,7 +198,7 @@ Supported MCP tools:
 
 ## Fidelity Diagnostics
 
-`fidelity.profiles.list` exposes replay/capture profile metadata for standard replay, browser replay, uTLS, curl-impersonate, and passthrough validation.
+`fidelity.profiles.list` exposes replay/capture profile metadata for standard replay, browser replay, uTLS, curl-impersonate, and passthrough validation. These profiles are backed by actual replay adapters; curl-impersonate requires an installed or bundled compatible binary.
 
 `fidelity.diagnose` recommends a replay profile for a captured flow based on tags, auth-bearing headers, interactive auth markers, and protocol metadata. The diagnostic is explicit about visibility versus TLS/client-fingerprint fidelity.
 

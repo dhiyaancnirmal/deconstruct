@@ -1,11 +1,9 @@
 package replay
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -22,16 +20,18 @@ import (
 const replaySessionID = "session_replay"
 
 type Engine struct {
-	store  *store.Store
-	blobs  *blobstore.Store
-	client *http.Client
+	store    *store.Store
+	blobs    *blobstore.Store
+	adapters map[string]Adapter
 }
 
 type Params struct {
-	FlowID    string    `json:"flow_id"`
-	Overrides Overrides `json:"overrides,omitempty"`
-	DryRun    bool      `json:"dry_run,omitempty"`
-	Retries   int       `json:"retries,omitempty"`
+	FlowID         string            `json:"flow_id"`
+	Overrides      Overrides         `json:"overrides,omitempty"`
+	DryRun         bool              `json:"dry_run,omitempty"`
+	Retries        int               `json:"retries,omitempty"`
+	Profile        string            `json:"profile,omitempty"`
+	ProfileOptions map[string]string `json:"profile_options,omitempty"`
 }
 
 type Overrides struct {
@@ -46,11 +46,14 @@ type Overrides struct {
 type Result struct {
 	Run             store.ReplayRun `json:"run"`
 	PreparedRequest PreparedRequest `json:"prepared_request"`
+	Profile         string          `json:"profile"`
 }
 
 type Variation struct {
-	Name      string    `json:"name"`
-	Overrides Overrides `json:"overrides,omitempty"`
+	Name           string            `json:"name"`
+	Overrides      Overrides         `json:"overrides,omitempty"`
+	Profile        string            `json:"profile,omitempty"`
+	ProfileOptions map[string]string `json:"profile_options,omitempty"`
 }
 
 type VariationParams struct {
@@ -71,19 +74,36 @@ type PreparedRequest struct {
 	Body    string      `json:"body,omitempty"`
 }
 
+type Adapter interface {
+	Name() string
+	Execute(context.Context, PreparedRequest, http.Header, []byte, map[string]string) (AdapterResult, error)
+}
+
+type AdapterResult struct {
+	Status   int
+	Headers  http.Header
+	Body     []byte
+	Duration time.Duration
+}
+
 func New(store *store.Store, blobs *blobstore.Store) (*Engine, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{
+	engine := &Engine{
 		store: store,
 		blobs: blobs,
-		client: &http.Client{
-			Timeout: 60 * time.Second,
-			Jar:     jar,
-		},
-	}, nil
+	}
+	engine.adapters = map[string]Adapter{
+		"standard":         NewStandardAdapter(jar),
+		"":                 NewStandardAdapter(jar),
+		"utls":             NewUTLSAdapter(),
+		"curl_impersonate": NewCurlImpersonateAdapter(""),
+		"browser":          NewBrowserAdapter(),
+		"passthrough":      PassthroughAdapter{},
+	}
+	return engine, nil
 }
 
 func (e *Engine) Run(ctx context.Context, params Params) (Result, error) {
@@ -107,7 +127,11 @@ func (e *Engine) Run(ctx context.Context, params Params) (Result, error) {
 		if err := e.store.InsertReplayRun(ctx, run); err != nil {
 			return Result{}, err
 		}
-		return Result{Run: run, PreparedRequest: prepared}, nil
+		return Result{Run: run, PreparedRequest: prepared, Profile: replayProfile(params.Profile)}, nil
+	}
+	adapter, err := e.adapter(params.Profile)
+	if err != nil {
+		return Result{}, err
 	}
 	attempts := params.Retries + 1
 	if attempts <= 0 {
@@ -119,13 +143,13 @@ func (e *Engine) Run(ctx context.Context, params Params) (Result, error) {
 	attemptsUsed := 0
 	for attempt := 1; attempt <= attempts; attempt++ {
 		attemptsUsed = attempt
-		resp, responseBody, duration, err := e.do(ctx, prepared, rawHeaders, rawBody)
+		result, err := adapter.Execute(ctx, prepared, rawHeaders, rawBody, params.ProfileOptions)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		responseStatus = resp.StatusCode
-		replayFlowID, err = e.recordReplayFlow(ctx, flow, prepared, rawHeaders, rawBody, resp.StatusCode, resp.Header, responseBody, duration)
+		responseStatus = result.Status
+		replayFlowID, err = e.recordReplayFlow(ctx, flow, prepared, rawHeaders, rawBody, result.Status, result.Headers, result.Body, result.Duration, adapter.Name())
 		if err != nil {
 			lastErr = err
 			continue
@@ -149,7 +173,7 @@ func (e *Engine) Run(ctx context.Context, params Params) (Result, error) {
 	if err := e.store.InsertReplayRun(ctx, run); err != nil {
 		return Result{}, err
 	}
-	return Result{Run: run, PreparedRequest: prepared}, nil
+	return Result{Run: run, PreparedRequest: prepared, Profile: adapter.Name()}, nil
 }
 
 func (e *Engine) RunVariations(ctx context.Context, params VariationParams) ([]VariationResult, error) {
@@ -166,9 +190,11 @@ func (e *Engine) RunVariations(ctx context.Context, params VariationParams) ([]V
 			name = fmt.Sprintf("variation_%d", i+1)
 		}
 		result, err := e.Run(ctx, Params{
-			FlowID:    params.FlowID,
-			Overrides: variation.Overrides,
-			Retries:   params.Retries,
+			FlowID:         params.FlowID,
+			Overrides:      variation.Overrides,
+			Retries:        params.Retries,
+			Profile:        variation.Profile,
+			ProfileOptions: variation.ProfileOptions,
 		})
 		if err != nil {
 			return nil, err
@@ -234,26 +260,7 @@ func (e *Engine) prepare(flow store.Flow, overrides Overrides) (PreparedRequest,
 	return prepared, headers, body, nil
 }
 
-func (e *Engine) do(ctx context.Context, prepared PreparedRequest, headers http.Header, body []byte) (*http.Response, []byte, time.Duration, error) {
-	start := time.Now()
-	req, err := http.NewRequestWithContext(ctx, prepared.Method, prepared.URL, bytes.NewReader(body))
-	if err != nil {
-		return nil, nil, 0, err
-	}
-	req.Header = headers.Clone()
-	resp, err := e.client.Do(req)
-	if err != nil {
-		return nil, nil, time.Since(start), err
-	}
-	defer resp.Body.Close()
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, nil, time.Since(start), err
-	}
-	return resp, responseBody, time.Since(start), nil
-}
-
-func (e *Engine) recordReplayFlow(ctx context.Context, original store.Flow, prepared PreparedRequest, requestHeaders http.Header, requestBody []byte, status int, responseHeaders http.Header, responseBody []byte, duration time.Duration) (string, error) {
+func (e *Engine) recordReplayFlow(ctx context.Context, original store.Flow, prepared PreparedRequest, requestHeaders http.Header, requestBody []byte, status int, responseHeaders http.Header, responseBody []byte, duration time.Duration, profile string) (string, error) {
 	if err := e.store.EnsureSession(ctx, store.Session{ID: replaySessionID, Name: "Replay runs", Kind: "replay", CreatedAt: time.Now().UTC()}); err != nil {
 		return "", err
 	}
@@ -281,7 +288,7 @@ func (e *Engine) recordReplayFlow(ctx context.Context, original store.Flow, prep
 		SessionID:       replaySessionID,
 		Method:          prepared.Method,
 		AppName:         "deconstruct",
-		Source:          "replay",
+		Source:          "replay:" + replayProfile(profile),
 		URL:             prepared.URL,
 		Host:            host,
 		Status:          status,
@@ -296,6 +303,7 @@ func (e *Engine) recordReplayFlow(ctx context.Context, original store.Flow, prep
 		return "", err
 	}
 	_ = e.store.TagFlow(ctx, flowID, "replay")
+	_ = e.store.TagFlow(ctx, flowID, "replay_profile:"+replayProfile(profile))
 	_ = e.store.TagFlow(ctx, flowID, "replay_of:"+original.ID)
 	for _, tag := range bodyparse.Tags(requestHeaders, requestBody) {
 		_ = e.store.TagFlow(ctx, flowID, tag)
@@ -304,6 +312,22 @@ func (e *Engine) recordReplayFlow(ctx context.Context, original store.Flow, prep
 		_ = e.store.TagFlow(ctx, flowID, tag)
 	}
 	return flowID, nil
+}
+
+func (e *Engine) adapter(profile string) (Adapter, error) {
+	name := replayProfile(profile)
+	adapter, ok := e.adapters[name]
+	if !ok {
+		return nil, fmt.Errorf("unsupported replay profile: %s", profile)
+	}
+	return adapter, nil
+}
+
+func replayProfile(profile string) string {
+	if profile == "" {
+		return "standard"
+	}
+	return profile
 }
 
 func removeHopByHopHeaders(headers http.Header) {

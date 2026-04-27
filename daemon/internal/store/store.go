@@ -75,14 +75,16 @@ type Workflow struct {
 }
 
 type WorkflowStep struct {
-	ID         string             `json:"id"`
-	FlowID     string             `json:"flow_id"`
-	Name       string             `json:"name"`
-	Class      string             `json:"class"`
-	Included   bool               `json:"included"`
-	Reason     string             `json:"reason,omitempty"`
-	Assertions WorkflowAssertions `json:"assertions,omitempty"`
-	Overrides  json.RawMessage    `json:"overrides,omitempty"`
+	ID             string             `json:"id"`
+	FlowID         string             `json:"flow_id"`
+	Name           string             `json:"name"`
+	Class          string             `json:"class"`
+	Included       bool               `json:"included"`
+	Reason         string             `json:"reason,omitempty"`
+	Assertions     WorkflowAssertions `json:"assertions,omitempty"`
+	Overrides      json.RawMessage    `json:"overrides,omitempty"`
+	ReplayProfile  string             `json:"replay_profile,omitempty"`
+	ProfileOptions map[string]string  `json:"profile_options,omitempty"`
 }
 
 type WorkflowAssertions struct {
