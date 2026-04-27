@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deconstruct.local/schemas/deconstruct/manifest.schema.json",
+  "title": "Deconstruct Bundle Manifest",
+  "type": "object",
+  "required": ["format", "version", "created_at"],
+  "properties": {
+    "format": {
+      "const": "deconstruct"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "sessions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "workflows": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false
+}
+
