@@ -47,6 +47,13 @@ type RunParams struct {
 	StepOutputs       map[string]map[string]string `json:"-"`
 }
 
+type sourceValue struct {
+	StepID string
+	Key    string
+	Path   string
+	Value  string
+}
+
 func NewBuilder(store Store, blobs *blobstore.Store) *Builder {
 	return &Builder{store: store, blobs: blobs}
 }
@@ -72,11 +79,13 @@ func (b *Builder) Suggest(ctx context.Context, params SuggestParams) (store.Work
 	}
 	properties := map[string]any{}
 	required := []string{}
+	flows := map[string]store.Flow{}
 	for index, flowID := range params.FlowIDs {
 		flow, err := b.store.GetFlow(ctx, flowID)
 		if err != nil {
 			return store.Workflow{}, err
 		}
+		flows[flow.ID] = flow
 		class, included, reason := classify(flow)
 		stepID := fmt.Sprintf("step_%02d", index+1)
 		step := store.WorkflowStep{
@@ -90,8 +99,8 @@ func (b *Builder) Suggest(ctx context.Context, params SuggestParams) (store.Work
 				Status: expectedStatuses(flow.Status),
 			},
 		}
-		for _, field := range b.inferInputFields(flow) {
-			properties[field] = map[string]string{"type": "string"}
+		for field, value := range b.inferInputDefaults(flow) {
+			properties[field] = map[string]string{"type": "string", "default": value}
 			required = append(required, field)
 		}
 		if step.Included {
@@ -106,6 +115,9 @@ func (b *Builder) Suggest(ctx context.Context, params SuggestParams) (store.Work
 		}
 		workflow.Steps = append(workflow.Steps, step)
 	}
+	if err := b.inferCrossStepBindings(workflow.Steps, flows); err != nil {
+		return store.Workflow{}, err
+	}
 	sort.Strings(required)
 	inputSchema, err := json.Marshal(map[string]any{
 		"type":       "object",
@@ -117,6 +129,151 @@ func (b *Builder) Suggest(ctx context.Context, params SuggestParams) (store.Work
 	}
 	workflow.InputSchema = inputSchema
 	return workflow, nil
+}
+
+func (b *Builder) inferCrossStepBindings(steps []store.WorkflowStep, flows map[string]store.Flow) error {
+	if b.blobs == nil {
+		return nil
+	}
+	var previous []sourceValue
+	for stepIndex := range steps {
+		step := &steps[stepIndex]
+		flow := flows[step.FlowID]
+		if step.Included && len(previous) > 0 {
+			overrides, err := stepOverrides(*step, nil, nil)
+			if err != nil {
+				return err
+			}
+			changed := false
+			headers := http.Header{}
+			if len(flow.RequestHeaders) > 0 {
+				_ = json.Unmarshal(flow.RequestHeaders, &headers)
+			}
+			for name, values := range headers {
+				for _, value := range values {
+					source, ok := matchingSource(previous, value)
+					if !ok {
+						continue
+					}
+					if overrides.Headers == nil {
+						overrides.Headers = map[string][]string{}
+					}
+					overrides.Headers[name] = []string{"${steps." + source.StepID + "." + source.Key + "}"}
+					ensureExtraction(&steps, source)
+					changed = true
+				}
+			}
+			if flow.RequestBlob != "" {
+				body, err := b.blobs.Get(flow.RequestBlob)
+				if err == nil && len(body) > 0 {
+					bodyText := string(body)
+					if overrides.Body != nil {
+						bodyText = *overrides.Body
+					}
+					for _, source := range previous {
+						if source.Value == "" || !strings.Contains(bodyText, source.Value) {
+							continue
+						}
+						bodyText = strings.ReplaceAll(bodyText, source.Value, "${steps."+source.StepID+"."+source.Key+"}")
+						ensureExtraction(&steps, source)
+						changed = true
+					}
+					if changed {
+						overrides.Body = &bodyText
+					}
+				}
+			}
+			if changed {
+				data, err := json.Marshal(overrides)
+				if err != nil {
+					return err
+				}
+				step.Overrides = data
+			}
+		}
+		if step.Included && flow.ResponseBlob != "" {
+			body, err := b.blobs.Get(flow.ResponseBlob)
+			if err == nil {
+				for _, source := range jsonPrimitiveSources(step.ID, body) {
+					previous = append(previous, source)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func matchingSource(sources []sourceValue, value string) (sourceValue, bool) {
+	if value == "" {
+		return sourceValue{}, false
+	}
+	for _, source := range sources {
+		if source.Value == value {
+			return source, true
+		}
+	}
+	return sourceValue{}, false
+}
+
+func ensureExtraction(steps *[]store.WorkflowStep, source sourceValue) {
+	for i := range *steps {
+		if (*steps)[i].ID != source.StepID {
+			continue
+		}
+		if (*steps)[i].Extract == nil {
+			(*steps)[i].Extract = map[string]string{}
+		}
+		(*steps)[i].Extract[source.Key] = source.Path
+		return
+	}
+}
+
+func jsonPrimitiveSources(stepID string, body []byte) []sourceValue {
+	var root any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil
+	}
+	var sources []sourceValue
+	var walk func(path string, value any)
+	walk = func(path string, value any) {
+		switch typed := value.(type) {
+		case map[string]any:
+			for key, child := range typed {
+				childPath := "$." + key
+				if path != "$" {
+					childPath = path + "." + key
+				}
+				walk(childPath, child)
+			}
+		case []any:
+			for i, child := range typed {
+				walk(fmt.Sprintf("%s[%d]", path, i), child)
+			}
+		case string:
+			if typed != "" {
+				sources = append(sources, sourceValue{StepID: stepID, Key: extractionKey(path), Path: path, Value: typed})
+			}
+		case float64, bool:
+			sources = append(sources, sourceValue{StepID: stepID, Key: extractionKey(path), Path: path, Value: fmt.Sprint(typed)})
+		}
+	}
+	walk("$", root)
+	return sources
+}
+
+func extractionKey(path string) string {
+	path = strings.TrimPrefix(path, "$.")
+	path = strings.ReplaceAll(path, "[", "_")
+	path = strings.ReplaceAll(path, "]", "")
+	path = strings.ReplaceAll(path, ".", "_")
+	path = strings.Trim(path, "_")
+	if path == "" {
+		return "value"
+	}
+	if sensitiveField(path) {
+		return "value_" + strconv.Itoa(len(path))
+	}
+	return path
 }
 
 func (b *Builder) Save(ctx context.Context, workflow store.Workflow) (store.Workflow, error) {
@@ -385,6 +542,16 @@ func expectedStatuses(status int) []int {
 }
 
 func (b *Builder) inferInputFields(flow store.Flow) []string {
+	defaults := b.inferInputDefaults(flow)
+	fields := make([]string, 0, len(defaults))
+	for field := range defaults {
+		fields = append(fields, field)
+	}
+	sort.Strings(fields)
+	return fields
+}
+
+func (b *Builder) inferInputDefaults(flow store.Flow) map[string]string {
 	if b.blobs == nil || flow.RequestBlob == "" {
 		return nil
 	}
@@ -396,13 +563,12 @@ func (b *Builder) inferInputFields(flow store.Flow) []string {
 	if err := json.Unmarshal(body, &object); err != nil {
 		return nil
 	}
-	var fields []string
+	fields := map[string]string{}
 	for key, value := range object {
-		if _, ok := value.(string); ok && !sensitiveField(key) {
-			fields = append(fields, key)
+		if text, ok := value.(string); ok && !sensitiveField(key) {
+			fields[key] = text
 		}
 	}
-	sort.Strings(fields)
 	return fields
 }
 

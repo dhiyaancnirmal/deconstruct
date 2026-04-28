@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/dhiyaan/deconstruct/daemon/internal/blobstore"
+	"github.com/dhiyaan/deconstruct/daemon/internal/replay"
 	"github.com/dhiyaan/deconstruct/daemon/internal/store"
 )
 
@@ -204,7 +205,40 @@ func Postman(ctx context.Context, store WorkflowStore, blobs *blobstore.Store, w
 
 func typescriptWorkflow(ctx context.Context, store WorkflowStore, blobs *blobstore.Store, workflow store.Workflow) (string, error) {
 	var b strings.Builder
-	fmt.Fprintf(&b, "import { inputSchema } from './schemas.js';\n\nexport async function %s(input: unknown) {\n  const parsed = inputSchema.parse(input);\n", actionName(workflow))
+	fmt.Fprintf(&b, `import { inputSchema } from './schemas.js';
+
+type StepOutputs = Record<string, Record<string, unknown>>;
+
+function readPath(value: unknown, path: string): unknown {
+  if (path === '$') return value;
+  if (!path.startsWith('$.')) return undefined;
+  let current: unknown = value;
+  for (const segment of path.slice(2).split('.')) {
+    const match = segment.match(/^([^\[]+)(?:\[(\d+)\])?$/);
+    if (!match || current === null || typeof current !== 'object') return undefined;
+    current = (current as Record<string, unknown>)[match[1]];
+    if (match[2] !== undefined) {
+      if (!Array.isArray(current)) return undefined;
+      current = current[Number(match[2])];
+    }
+  }
+  return current;
+}
+
+function bind(value: string, input: Record<string, unknown>, steps: StepOutputs): string {
+  return value
+    .replace(/\$\{input\.([^}]+)\}/g, (_, key) => String(input[key] ?? ''))
+    .replace(/\$\{steps\.([^.}]+)\.([^}]+)\}/g, (_, stepID, key) => String(steps[stepID]?.[key] ?? ''));
+}
+
+function bindHeaders(headers: Record<string, string>, input: Record<string, unknown>, steps: StepOutputs): Record<string, string> {
+  return Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, bind(value, input, steps)]));
+}
+
+export async function %s(input: unknown) {
+  const parsed = inputSchema.parse(input);
+  const steps: StepOutputs = {};
+`, actionName(workflow))
 	for index, step := range workflow.Steps {
 		if !step.Included {
 			continue
@@ -213,25 +247,108 @@ func typescriptWorkflow(ctx context.Context, store WorkflowStore, blobs *blobsto
 		if err != nil {
 			return "", err
 		}
-		body := ""
-		if blobs != nil && flow.RequestBlob != "" {
-			raw, _ := blobs.Get(flow.RequestBlob)
-			body = string(raw)
-		}
-		headers, redactedBody, err := redactedExportInputs(flow, []byte(body))
+		compiled, err := compileStep(blobs, flow, step)
 		if err != nil {
 			return "", err
 		}
-		if len(redactedBody) > 0 {
-			body = string(redactedBody)
-		}
-		headerJSON, _ := json.Marshal(headers)
-		bodyJSON, _ := json.Marshal(body)
-		fmt.Fprintf(&b, "  const step%d = await fetch(%q, { method: %q, headers: %s, body: %s });\n", index+1, flow.URL, flow.Method, string(headerJSON), string(bodyJSON))
-		fmt.Fprintf(&b, "  if (!step%d.ok) throw new Error(%q + step%d.status);\n", index+1, step.ID+" failed: ", index+1)
+		headerJSON, _ := json.Marshal(compiled.Headers)
+		bodyJSON, _ := json.Marshal(compiled.Body)
+		statusJSON, _ := json.Marshal(compiled.Statuses)
+		extractJSON, _ := json.Marshal(stringMap(step.Extract))
+		jsonPathJSON, _ := json.Marshal(stringSlice(step.Assertions.JSONPath))
+		bodyContainsJSON, _ := json.Marshal(stringSlice(step.Assertions.BodyContains))
+		fmt.Fprintf(&b, "  const step%dBody = %s === '' ? undefined : bind(%s, parsed, steps);\n", index+1, bodyJSON, bodyJSON)
+		fmt.Fprintf(&b, "  const step%d = await fetch(%q, { method: %q, headers: bindHeaders(%s, parsed, steps), body: step%dBody });\n", index+1, compiled.URL, compiled.Method, string(headerJSON), index+1)
+		fmt.Fprintf(&b, "  if (!%s.includes(step%d.status)) throw new Error(%q + step%d.status);\n", string(statusJSON), index+1, step.ID+" failed: ", index+1)
+		fmt.Fprintf(&b, "  const step%dText = await step%d.text();\n  let step%dJSON: unknown = undefined;\n  try { step%dJSON = step%dText ? JSON.parse(step%dText) : undefined; } catch {}\n", index+1, index+1, index+1, index+1, index+1, index+1)
+		fmt.Fprintf(&b, "  for (const path of %s) if (readPath(step%dJSON, path) === undefined) throw new Error(%q + path);\n", string(jsonPathJSON), index+1, step.ID+" missing JSON path: ")
+		fmt.Fprintf(&b, "  for (const needle of %s) if (!step%dText.includes(needle)) throw new Error(%q + needle);\n", string(bodyContainsJSON), index+1, step.ID+" missing body text: ")
+		fmt.Fprintf(&b, "  steps[%q] = Object.fromEntries(Object.entries(%s).map(([key, path]) => [key, readPath(step%dJSON, path as string)]));\n", step.ID, string(extractJSON), index+1)
 	}
 	b.WriteString("  return { ok: true, input: parsed };\n}\n")
 	return b.String(), nil
+}
+
+type compiledStep struct {
+	Method   string
+	URL      string
+	Headers  map[string]string
+	Body     string
+	Statuses []int
+}
+
+func compileStep(blobs *blobstore.Store, flow store.Flow, step store.WorkflowStep) (compiledStep, error) {
+	body := []byte{}
+	if blobs != nil && flow.RequestBlob != "" {
+		raw, _ := blobs.Get(flow.RequestBlob)
+		body = raw
+	}
+	headers, redactedBody, err := redactedExportInputs(flow, body)
+	if err != nil {
+		return compiledStep{}, err
+	}
+	method := flow.Method
+	targetURL := flow.URL
+	bodyText := string(redactedBody)
+	var overrides replay.Overrides
+	if len(step.Overrides) > 0 {
+		if err := json.Unmarshal(step.Overrides, &overrides); err != nil {
+			return compiledStep{}, err
+		}
+		if overrides.Method != "" {
+			method = overrides.Method
+		}
+		if overrides.URL != "" {
+			targetURL = overrides.URL
+		}
+		for _, name := range overrides.RemoveHeaders {
+			delete(headers, name)
+		}
+		for name, values := range overrides.Headers {
+			headers[name] = strings.Join(values, ", ")
+		}
+		if len(overrides.Query) > 0 {
+			parsed, err := url.Parse(targetURL)
+			if err != nil {
+				return compiledStep{}, err
+			}
+			query := parsed.Query()
+			for key, value := range overrides.Query {
+				query.Set(key, value)
+			}
+			parsed.RawQuery = query.Encode()
+			targetURL = parsed.String()
+		}
+		if overrides.Body != nil {
+			bodyText = *overrides.Body
+		}
+	}
+	statuses := step.Assertions.Status
+	if len(statuses) == 0 {
+		statuses = expectedStatusSet(flow.Status)
+	}
+	return compiledStep{Method: method, URL: targetURL, Headers: headers, Body: bodyText, Statuses: statuses}, nil
+}
+
+func expectedStatusSet(status int) []int {
+	if status >= 200 && status < 400 {
+		return []int{status}
+	}
+	return []int{200, 201, 202, 204}
+}
+
+func stringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return map[string]string{}
+	}
+	return values
+}
+
+func stringSlice(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
 }
 
 func pythonWorkflow(ctx context.Context, store WorkflowStore, blobs *blobstore.Store, workflow store.Workflow) (string, error) {

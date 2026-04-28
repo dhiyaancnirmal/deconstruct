@@ -11,3 +11,6 @@ coverage.out
 *.sock
 blobs/
 
+# Private eval inputs/outputs
+private-hars/
+eval-output/
