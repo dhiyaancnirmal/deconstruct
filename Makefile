@@ -10,6 +10,7 @@ build:
 	mkdir -p $(BIN_DIR)
 	cd $(DAEMON_DIR) && go build -o ../$(BIN_DIR)/deconstructd ./cmd/deconstructd
 	cd $(DAEMON_DIR) && go build -o ../$(BIN_DIR)/deconstruct-eval ./cmd/deconstruct-eval
+	cd $(DAEMON_DIR) && go build -o ../$(BIN_DIR)/deconstruct-capture-har ./cmd/deconstruct-capture-har
 
 smoke: build
 	./$(BIN_DIR)/deconstructd --version

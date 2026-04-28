@@ -54,6 +54,14 @@ type sourceValue struct {
 	Value  string
 }
 
+const (
+	maxBindingSources     = 1000
+	maxSourcesPerResponse = 80
+	maxBindingBodyBytes   = 256 * 1024
+	minBindingValueLength = 4
+	maxBindingValueLength = 512
+)
+
 func NewBuilder(store Store, blobs *blobstore.Store) *Builder {
 	return &Builder{store: store, blobs: blobs}
 }
@@ -136,6 +144,7 @@ func (b *Builder) inferCrossStepBindings(steps []store.WorkflowStep, flows map[s
 		return nil
 	}
 	var previous []sourceValue
+	previousByValue := map[string]sourceValue{}
 	for stepIndex := range steps {
 		step := &steps[stepIndex]
 		flow := flows[step.FlowID]
@@ -151,7 +160,7 @@ func (b *Builder) inferCrossStepBindings(steps []store.WorkflowStep, flows map[s
 			}
 			for name, values := range headers {
 				for _, value := range values {
-					source, ok := matchingSource(previous, value)
+					source, ok := previousByValue[value]
 					if !ok {
 						continue
 					}
@@ -165,7 +174,7 @@ func (b *Builder) inferCrossStepBindings(steps []store.WorkflowStep, flows map[s
 			}
 			if flow.RequestBlob != "" {
 				body, err := b.blobs.Get(flow.RequestBlob)
-				if err == nil && len(body) > 0 {
+				if err == nil && len(body) > 0 && len(body) <= maxBindingBodyBytes {
 					bodyText := string(body)
 					if overrides.Body != nil {
 						bodyText = *overrides.Body
@@ -193,9 +202,19 @@ func (b *Builder) inferCrossStepBindings(steps []store.WorkflowStep, flows map[s
 		}
 		if step.Included && flow.ResponseBlob != "" {
 			body, err := b.blobs.Get(flow.ResponseBlob)
-			if err == nil {
+			if err == nil && len(body) <= maxBindingBodyBytes {
 				for _, source := range jsonPrimitiveSources(step.ID, body) {
+					if len(previous) >= maxBindingSources {
+						break
+					}
+					if !bindingValueUseful(source.Value) {
+						continue
+					}
+					if _, exists := previousByValue[source.Value]; exists {
+						continue
+					}
 					previous = append(previous, source)
+					previousByValue[source.Value] = source
 				}
 			}
 		}
@@ -236,6 +255,9 @@ func jsonPrimitiveSources(stepID string, body []byte) []sourceValue {
 	var sources []sourceValue
 	var walk func(path string, value any)
 	walk = func(path string, value any) {
+		if len(sources) >= maxSourcesPerResponse {
+			return
+		}
 		switch typed := value.(type) {
 		case map[string]any:
 			for key, child := range typed {
@@ -259,6 +281,16 @@ func jsonPrimitiveSources(stepID string, body []byte) []sourceValue {
 	}
 	walk("$", root)
 	return sources
+}
+
+func bindingValueUseful(value string) bool {
+	if len(value) < minBindingValueLength || len(value) > maxBindingValueLength {
+		return false
+	}
+	if strings.Contains(value, "\n") || strings.Contains(value, "\x00") {
+		return false
+	}
+	return true
 }
 
 func extractionKey(path string) string {
