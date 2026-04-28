@@ -83,12 +83,16 @@ type WorkflowStep struct {
 	Reason         string             `json:"reason,omitempty"`
 	Assertions     WorkflowAssertions `json:"assertions,omitempty"`
 	Overrides      json.RawMessage    `json:"overrides,omitempty"`
+	Extract        map[string]string  `json:"extract,omitempty"`
 	ReplayProfile  string             `json:"replay_profile,omitempty"`
 	ProfileOptions map[string]string  `json:"profile_options,omitempty"`
 }
 
 type WorkflowAssertions struct {
-	Status []int `json:"status,omitempty"`
+	Status       []int    `json:"status,omitempty"`
+	JSONPath     []string `json:"json_path,omitempty"`
+	Header       []string `json:"header,omitempty"`
+	BodyContains []string `json:"body_contains,omitempty"`
 }
 
 type WorkflowRun struct {
@@ -196,6 +200,24 @@ type ExportArtifact struct {
 	Kind       string          `json:"kind"`
 	FilesJSON  json.RawMessage `json:"files_json,omitempty"`
 	CreatedAt  time.Time       `json:"created_at"`
+}
+
+type ProtocolSchema struct {
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Kind      string          `json:"kind"`
+	Source    string          `json:"source,omitempty"`
+	Summary   json.RawMessage `json:"summary,omitempty"`
+	CreatedAt time.Time       `json:"created_at"`
+}
+
+type CapturePolicy struct {
+	ID        string    `json:"id"`
+	Scope     string    `json:"scope"`
+	Matcher   string    `json:"matcher"`
+	Action    string    `json:"action"`
+	TLSMode   string    `json:"tls_mode,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 func Open(path string) (*Store, error) {
@@ -325,6 +347,24 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_at TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_export_artifacts_workflow ON export_artifacts(workflow_id, created_at)`,
+		`CREATE TABLE IF NOT EXISTS protocol_schemas (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			source TEXT NOT NULL,
+			summary_json TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_protocol_schemas_kind ON protocol_schemas(kind, created_at)`,
+		`CREATE TABLE IF NOT EXISTS capture_policies (
+			id TEXT PRIMARY KEY,
+			scope TEXT NOT NULL,
+			matcher TEXT NOT NULL,
+			action TEXT NOT NULL,
+			tls_mode TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_capture_policies_scope ON capture_policies(scope, matcher)`,
 	}
 	for _, stmt := range statements {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -1075,6 +1115,197 @@ func (s *Store) ListExportArtifacts(ctx context.Context, workflowID string, limi
 		artifacts = append(artifacts, artifact)
 	}
 	return artifacts, rows.Err()
+}
+
+func (s *Store) SaveProtocolSchema(ctx context.Context, schema ProtocolSchema) error {
+	if schema.ID == "" {
+		return errors.New("protocol schema id is required")
+	}
+	if schema.Name == "" {
+		return errors.New("protocol schema name is required")
+	}
+	if schema.Kind == "" {
+		return errors.New("protocol schema kind is required")
+	}
+	if len(schema.Summary) == 0 {
+		schema.Summary = json.RawMessage(`{}`)
+	}
+	if schema.CreatedAt.IsZero() {
+		schema.CreatedAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO protocol_schemas (id, name, kind, source, summary_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			name = excluded.name,
+			kind = excluded.kind,
+			source = excluded.source,
+			summary_json = excluded.summary_json
+	`, schema.ID, schema.Name, schema.Kind, schema.Source, string(schema.Summary), schema.CreatedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("save protocol schema: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetProtocolSchema(ctx context.Context, id string) (ProtocolSchema, error) {
+	var schema ProtocolSchema
+	var summary string
+	var created string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, name, kind, source, summary_json, created_at
+		FROM protocol_schemas
+		WHERE id = ?
+	`, id).Scan(&schema.ID, &schema.Name, &schema.Kind, &schema.Source, &summary, &created)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ProtocolSchema{}, fmt.Errorf("protocol schema not found: %s", id)
+		}
+		return ProtocolSchema{}, fmt.Errorf("get protocol schema: %w", err)
+	}
+	schema.Summary = json.RawMessage(summary)
+	schema.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+	if err != nil {
+		return ProtocolSchema{}, fmt.Errorf("parse protocol schema time: %w", err)
+	}
+	return schema, nil
+}
+
+func (s *Store) ListProtocolSchemas(ctx context.Context, kind string, limit int) ([]ProtocolSchema, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	query := `
+		SELECT id, name, kind, source, summary_json, created_at
+		FROM protocol_schemas
+	`
+	var args []any
+	if kind != "" {
+		query += `WHERE kind = ? `
+		args = append(args, kind)
+	}
+	query += `ORDER BY created_at DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list protocol schemas: %w", err)
+	}
+	defer rows.Close()
+	var schemas []ProtocolSchema
+	for rows.Next() {
+		var schema ProtocolSchema
+		var summary string
+		var created string
+		if err := rows.Scan(&schema.ID, &schema.Name, &schema.Kind, &schema.Source, &summary, &created); err != nil {
+			return nil, fmt.Errorf("scan protocol schema: %w", err)
+		}
+		schema.Summary = json.RawMessage(summary)
+		schema.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+		if err != nil {
+			return nil, fmt.Errorf("parse protocol schema time: %w", err)
+		}
+		schemas = append(schemas, schema)
+	}
+	return schemas, rows.Err()
+}
+
+func (s *Store) Stats(ctx context.Context) (map[string]int64, error) {
+	tables := []string{"sessions", "flows", "replay_runs", "workflows", "workflow_runs", "auth_chains", "auth_profiles", "export_artifacts", "protocol_schemas", "capture_policies"}
+	stats := map[string]int64{}
+	for _, table := range tables {
+		var count int64
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table).Scan(&count); err != nil {
+			return nil, fmt.Errorf("count %s: %w", table, err)
+		}
+		stats[table] = count
+	}
+	return stats, nil
+}
+
+func (s *Store) PruneFlowsBefore(ctx context.Context, before time.Time, dryRun bool) (int64, error) {
+	var count int64
+	beforeText := before.UTC().Format(time.RFC3339Nano)
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM flows WHERE created_at < ?`, beforeText).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count prunable flows: %w", err)
+	}
+	if dryRun || count == 0 {
+		return count, nil
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM flows WHERE created_at < ?`, beforeText); err != nil {
+		return 0, fmt.Errorf("prune flows: %w", err)
+	}
+	return count, nil
+}
+
+func (s *Store) SaveCapturePolicy(ctx context.Context, policy CapturePolicy) error {
+	if policy.ID == "" {
+		return errors.New("capture policy id is required")
+	}
+	if policy.Scope == "" || policy.Matcher == "" || policy.Action == "" {
+		return errors.New("capture policy scope, matcher, and action are required")
+	}
+	if policy.TLSMode == "" {
+		policy.TLSMode = "metadata"
+	}
+	if policy.CreatedAt.IsZero() {
+		policy.CreatedAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO capture_policies (id, scope, matcher, action, tls_mode, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			scope = excluded.scope,
+			matcher = excluded.matcher,
+			action = excluded.action,
+			tls_mode = excluded.tls_mode
+	`, policy.ID, policy.Scope, policy.Matcher, policy.Action, policy.TLSMode, policy.CreatedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("save capture policy: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListCapturePolicies(ctx context.Context, scope string) ([]CapturePolicy, error) {
+	query := `
+		SELECT id, scope, matcher, action, tls_mode, created_at
+		FROM capture_policies
+	`
+	var args []any
+	if scope != "" {
+		query += `WHERE scope = ? `
+		args = append(args, scope)
+	}
+	query += `ORDER BY created_at DESC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list capture policies: %w", err)
+	}
+	defer rows.Close()
+	var policies []CapturePolicy
+	for rows.Next() {
+		var policy CapturePolicy
+		var created string
+		if err := rows.Scan(&policy.ID, &policy.Scope, &policy.Matcher, &policy.Action, &policy.TLSMode, &created); err != nil {
+			return nil, fmt.Errorf("scan capture policy: %w", err)
+		}
+		policy.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+		if err != nil {
+			return nil, fmt.Errorf("parse capture policy time: %w", err)
+		}
+		policies = append(policies, policy)
+	}
+	return policies, rows.Err()
+}
+
+func (s *Store) DeleteCapturePolicy(ctx context.Context, id string) error {
+	if id == "" {
+		return errors.New("capture policy id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM capture_policies WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete capture policy: %w", err)
+	}
+	return nil
 }
 
 func defaultString(value, fallback string) string {

@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,13 +36,15 @@ type SuggestParams struct {
 }
 
 type RunParams struct {
-	WorkflowID     string            `json:"workflow_id"`
-	Inputs         map[string]any    `json:"inputs,omitempty"`
-	DryRun         bool              `json:"dry_run,omitempty"`
-	AuthProfileID  string            `json:"auth_profile_id,omitempty"`
-	ReplayProfile  string            `json:"replay_profile,omitempty"`
-	ProfileOptions map[string]string `json:"profile_options,omitempty"`
-	AuthMaterial   map[string]string `json:"-"`
+	WorkflowID        string                       `json:"workflow_id"`
+	Inputs            map[string]any               `json:"inputs,omitempty"`
+	DryRun            bool                         `json:"dry_run,omitempty"`
+	AuthProfileID     string                       `json:"auth_profile_id,omitempty"`
+	AuthRefreshFlowID string                       `json:"-"`
+	ReplayProfile     string                       `json:"replay_profile,omitempty"`
+	ProfileOptions    map[string]string            `json:"profile_options,omitempty"`
+	AuthMaterial      map[string]string            `json:"-"`
+	StepOutputs       map[string]map[string]string `json:"-"`
 }
 
 func NewBuilder(store Store, blobs *blobstore.Store) *Builder {
@@ -151,52 +155,206 @@ func (b *Builder) Run(ctx context.Context, workflow store.Workflow, params RunPa
 		OK:         true,
 		CreatedAt:  time.Now().UTC(),
 	}
+	stepOutputs := map[string]map[string]string{}
 	for _, step := range workflow.Steps {
 		if !step.Included {
 			continue
 		}
-		overrides, err := stepOverrides(step, params.Inputs)
+		params.StepOutputs = stepOutputs
+		stepRun, err := b.runStep(ctx, engine, step, params)
 		if err != nil {
 			run.OK = false
 			run.Error = err.Error()
-			run.StepRuns = append(run.StepRuns, store.WorkflowStepRun{StepID: step.ID, FlowID: step.FlowID, OK: false, Error: err.Error()})
+			run.StepRuns = append(run.StepRuns, stepRun)
 			break
 		}
-		applyAuthMaterial(&overrides, params.AuthMaterial)
-		profile := params.ReplayProfile
-		profileOptions := params.ProfileOptions
-		if step.ReplayProfile != "" {
-			profile = step.ReplayProfile
-			profileOptions = step.ProfileOptions
+		ok := stepRun.OK
+		if !ok {
+			if refreshRun, refreshed := b.tryAuthRefresh(ctx, engine, params, stepRun); refreshed {
+				run.StepRuns = append(run.StepRuns, stepRun)
+				run.StepRuns = append(run.StepRuns, refreshRun)
+				if !refreshRun.OK {
+					run.OK = false
+					run.Error = fmt.Sprintf("auth refresh failed: %s", refreshRun.Error)
+					break
+				}
+				params.StepOutputs = stepOutputs
+				retriedStepRun, err := b.runStep(ctx, engine, step, params)
+				if err != nil {
+					run.OK = false
+					run.Error = err.Error()
+					run.StepRuns = append(run.StepRuns, retriedStepRun)
+					break
+				}
+				stepRun = retriedStepRun
+				ok = stepRun.OK
+			}
 		}
-		result, err := engine.Run(ctx, replay.Params{FlowID: step.FlowID, Overrides: overrides, DryRun: params.DryRun, Profile: profile, ProfileOptions: profileOptions})
+		if !ok {
+			run.OK = false
+			run.Error = fmt.Sprintf("step %s assertion failed: %s", step.ID, stepRun.Error)
+		}
+		run.StepRuns = append(run.StepRuns, stepRun)
+		if !ok {
+			break
+		}
+		outputs, err := b.extractStepOutputs(ctx, step, stepRun)
 		if err != nil {
 			run.OK = false
-			run.Error = err.Error()
-			run.StepRuns = append(run.StepRuns, store.WorkflowStepRun{StepID: step.ID, FlowID: step.FlowID, OK: false, Error: err.Error()})
+			run.Error = fmt.Sprintf("step %s extraction failed: %s", step.ID, err)
 			break
 		}
-		ok := assertStatus(result.Run.Status, step.Assertions.Status, params.DryRun)
-		if !ok {
-			run.OK = false
-			run.Error = fmt.Sprintf("step %s status assertion failed: %d", step.ID, result.Run.Status)
-		}
-		run.StepRuns = append(run.StepRuns, store.WorkflowStepRun{
-			StepID:      step.ID,
-			FlowID:      step.FlowID,
-			ReplayRunID: result.Run.ID,
-			OK:          ok,
-			Status:      result.Run.Status,
-			Error:       result.Run.Error,
-		})
-		if !ok {
-			break
+		if len(outputs) > 0 {
+			stepOutputs[step.ID] = outputs
 		}
 	}
 	if err := b.store.InsertWorkflowRun(ctx, run); err != nil {
 		return store.WorkflowRun{}, err
 	}
 	return run, nil
+}
+
+func (b *Builder) runStep(ctx context.Context, engine *replay.Engine, step store.WorkflowStep, params RunParams) (store.WorkflowStepRun, error) {
+	overrides, err := stepOverrides(step, params.Inputs, params.StepOutputs)
+	if err != nil {
+		return store.WorkflowStepRun{StepID: step.ID, FlowID: step.FlowID, OK: false, Error: err.Error()}, err
+	}
+	applyAuthMaterial(&overrides, params.AuthMaterial)
+	profile := params.ReplayProfile
+	profileOptions := params.ProfileOptions
+	if step.ReplayProfile != "" {
+		profile = step.ReplayProfile
+		profileOptions = step.ProfileOptions
+	}
+	result, err := engine.Run(ctx, replay.Params{FlowID: step.FlowID, Overrides: overrides, DryRun: params.DryRun, Profile: profile, ProfileOptions: profileOptions})
+	if err != nil {
+		return store.WorkflowStepRun{StepID: step.ID, FlowID: step.FlowID, OK: false, Error: err.Error()}, err
+	}
+	ok, assertionError := b.assertStep(ctx, result.Run, step, params.DryRun)
+	if result.Run.Error != "" && assertionError == "" {
+		assertionError = result.Run.Error
+	}
+	return store.WorkflowStepRun{
+		StepID:      step.ID,
+		FlowID:      step.FlowID,
+		ReplayRunID: result.Run.ID,
+		OK:          ok,
+		Status:      result.Run.Status,
+		Error:       assertionError,
+	}, nil
+}
+
+func (b *Builder) assertStep(ctx context.Context, run store.ReplayRun, step store.WorkflowStep, dryRun bool) (bool, string) {
+	if !assertStatus(run.Status, step.Assertions.Status, dryRun) {
+		return false, fmt.Sprintf("status %d not in %v", run.Status, step.Assertions.Status)
+	}
+	if dryRun {
+		return true, ""
+	}
+	if len(step.Assertions.JSONPath) == 0 && len(step.Assertions.Header) == 0 && len(step.Assertions.BodyContains) == 0 {
+		return run.OK, run.Error
+	}
+	body, headers, err := b.responseForReplay(ctx, run)
+	if err != nil {
+		return false, err.Error()
+	}
+	for _, name := range step.Assertions.Header {
+		if headers.Get(name) == "" {
+			return false, fmt.Sprintf("missing response header %s", name)
+		}
+	}
+	for _, needle := range step.Assertions.BodyContains {
+		if !strings.Contains(string(body), needle) {
+			return false, fmt.Sprintf("response body missing %q", needle)
+		}
+	}
+	for _, path := range step.Assertions.JSONPath {
+		if _, ok := jsonPathValue(body, path); !ok {
+			return false, fmt.Sprintf("missing response json path %s", path)
+		}
+	}
+	return run.OK, run.Error
+}
+
+func (b *Builder) extractStepOutputs(ctx context.Context, step store.WorkflowStep, stepRun store.WorkflowStepRun) (map[string]string, error) {
+	if len(step.Extract) == 0 {
+		return nil, nil
+	}
+	replayRun, err := b.replayRun(ctx, stepRun.ReplayRunID)
+	if err != nil {
+		return nil, err
+	}
+	body, _, err := b.responseForReplay(ctx, replayRun)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for key, path := range step.Extract {
+		value, ok := jsonPathValue(body, path)
+		if !ok {
+			return nil, fmt.Errorf("missing extraction path %s", path)
+		}
+		out[key] = fmt.Sprint(value)
+	}
+	return out, nil
+}
+
+func (b *Builder) responseForReplay(ctx context.Context, run store.ReplayRun) ([]byte, http.Header, error) {
+	if run.ReplayFlowID == "" {
+		return nil, nil, fmt.Errorf("replay flow is unavailable")
+	}
+	flow, err := b.store.GetFlow(ctx, run.ReplayFlowID)
+	if err != nil {
+		return nil, nil, err
+	}
+	headers := http.Header{}
+	if len(flow.ResponseHeaders) > 0 {
+		_ = json.Unmarshal(flow.ResponseHeaders, &headers)
+	}
+	if b.blobs == nil || flow.ResponseBlob == "" {
+		return nil, headers, nil
+	}
+	body, err := b.blobs.Get(flow.ResponseBlob)
+	if err != nil {
+		return nil, nil, err
+	}
+	return body, headers, nil
+}
+
+func (b *Builder) replayRun(ctx context.Context, id string) (store.ReplayRun, error) {
+	if id == "" {
+		return store.ReplayRun{}, fmt.Errorf("replay run is unavailable")
+	}
+	storeBackend, ok := b.store.(*store.Store)
+	if !ok {
+		return store.ReplayRun{}, fmt.Errorf("workflow runner requires store backend")
+	}
+	return storeBackend.GetReplayRun(ctx, id)
+}
+
+func (b *Builder) tryAuthRefresh(ctx context.Context, engine *replay.Engine, params RunParams, failed store.WorkflowStepRun) (store.WorkflowStepRun, bool) {
+	if params.DryRun || params.AuthRefreshFlowID == "" || !authFailureStatus(failed.Status) {
+		return store.WorkflowStepRun{}, false
+	}
+	overrides := replay.Overrides{}
+	applyAuthMaterial(&overrides, params.AuthMaterial)
+	result, err := engine.Run(ctx, replay.Params{FlowID: params.AuthRefreshFlowID, Overrides: overrides, Profile: params.ReplayProfile, ProfileOptions: params.ProfileOptions})
+	if err != nil {
+		return store.WorkflowStepRun{StepID: "auth_refresh", FlowID: params.AuthRefreshFlowID, OK: false, Error: err.Error()}, true
+	}
+	ok := result.Run.OK
+	return store.WorkflowStepRun{
+		StepID:      "auth_refresh",
+		FlowID:      params.AuthRefreshFlowID,
+		ReplayRunID: result.Run.ID,
+		OK:          ok,
+		Status:      result.Run.Status,
+		Error:       result.Run.Error,
+	}, true
+}
+
+func authFailureStatus(status int) bool {
+	return status == 401 || status == 403 || status == 419 || status == 440
 }
 
 func classify(flow store.Flow) (string, bool, string) {
@@ -327,7 +485,7 @@ func canonicalAuthHeader(key string) string {
 	}
 }
 
-func stepOverrides(step store.WorkflowStep, inputs map[string]any) (replay.Overrides, error) {
+func stepOverrides(step store.WorkflowStep, inputs map[string]any, stepOutputs map[string]map[string]string) (replay.Overrides, error) {
 	if len(step.Overrides) == 0 {
 		return replay.Overrides{}, nil
 	}
@@ -337,28 +495,87 @@ func stepOverrides(step store.WorkflowStep, inputs map[string]any) (replay.Overr
 	}
 	if overrides.Body != nil {
 		body := *overrides.Body
-		for key, value := range inputs {
-			body = strings.ReplaceAll(body, "${input."+key+"}", fmt.Sprint(value))
-		}
+		body = replaceBindings(body, inputs, stepOutputs)
 		overrides.Body = &body
 	}
 	for key, value := range overrides.Query {
-		overrides.Query[key] = replaceInputs(value, inputs)
+		overrides.Query[key] = replaceBindings(value, inputs, stepOutputs)
 	}
 	for key, values := range overrides.Headers {
 		for i, value := range values {
-			values[i] = replaceInputs(value, inputs)
+			values[i] = replaceBindings(value, inputs, stepOutputs)
 		}
 		overrides.Headers[key] = values
 	}
 	return overrides, nil
 }
 
-func replaceInputs(value string, inputs map[string]any) string {
+func replaceBindings(value string, inputs map[string]any, stepOutputs map[string]map[string]string) string {
 	for key, input := range inputs {
 		value = strings.ReplaceAll(value, "${input."+key+"}", fmt.Sprint(input))
 	}
+	for stepID, outputs := range stepOutputs {
+		for key, output := range outputs {
+			value = strings.ReplaceAll(value, "${steps."+stepID+"."+key+"}", output)
+		}
+	}
 	return value
+}
+
+func jsonPathValue(body []byte, path string) (any, bool) {
+	var root any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil, false
+	}
+	if path == "$" {
+		return root, true
+	}
+	if !strings.HasPrefix(path, "$.") {
+		return nil, false
+	}
+	current := root
+	for _, token := range splitJSONPath(strings.TrimPrefix(path, "$.")) {
+		switch value := current.(type) {
+		case map[string]any:
+			next, ok := value[token.field]
+			if !ok {
+				return nil, false
+			}
+			current = next
+		default:
+			return nil, false
+		}
+		if token.index != nil {
+			items, ok := current.([]any)
+			if !ok || *token.index < 0 || *token.index >= len(items) {
+				return nil, false
+			}
+			current = items[*token.index]
+		}
+	}
+	return current, true
+}
+
+type jsonPathToken struct {
+	field string
+	index *int
+}
+
+func splitJSONPath(path string) []jsonPathToken {
+	raw := strings.Split(path, ".")
+	tokens := make([]jsonPathToken, 0, len(raw))
+	for _, part := range raw {
+		token := jsonPathToken{field: part}
+		if open := strings.Index(part, "["); open >= 0 && strings.HasSuffix(part, "]") {
+			token.field = part[:open]
+			indexValue, err := strconv.Atoi(strings.TrimSuffix(part[open+1:], "]"))
+			if err == nil {
+				token.index = &indexValue
+			}
+		}
+		tokens = append(tokens, token)
+	}
+	return tokens
 }
 
 func assertStatus(status int, allowed []int, dryRun bool) bool {

@@ -69,19 +69,22 @@ func TypeScriptProject(ctx context.Context, store WorkflowStore, blobs *blobstor
 		return Project{}, err
 	}
 	files := []ProjectFile{
-		{Path: "package.json", Content: fmt.Sprintf(`{"type":"module","scripts":{"start":"tsx src/index.ts","test":"node --test"},"dependencies":{"zod":"latest","tsx":"latest"}}%s`, "\n")},
+		{Path: "package.json", Content: fmt.Sprintf(`{"type":"module","scripts":{"start":"tsx src/index.ts","serve":"tsx src/server.ts","test":"tsx --test test/*.test.js"},"dependencies":{"zod":"latest","tsx":"latest"}}%s`, "\n")},
 		{Path: "src/index.ts", Content: fmt.Sprintf("export { %s } from './workflow.js';\n", action)},
 		{Path: "src/workflow.ts", Content: workflowCode},
+		{Path: "src/server.ts", Content: typescriptServer(action)},
 		{Path: "src/schemas.ts", Content: "import { z } from 'zod';\n\nexport const inputSchema = z.object({}).passthrough();\nexport const outputSchema = z.object({}).passthrough();\n"},
+		{Path: "test/workflow.test.js", Content: fmt.Sprintf("import assert from 'node:assert/strict';\nimport { test } from 'node:test';\nimport { %s } from '../src/workflow.ts';\n\ntest('workflow function is exported', () => {\n  assert.equal(typeof %s, 'function');\n});\n", action, action)},
 		{Path: "openapi.json", Content: string(openAPIJSON) + "\n"},
 		{Path: ".env.example", Content: "# Add workflow secrets here. Do not commit live tokens.\n"},
-		{Path: "README.md", Content: fmt.Sprintf("# %s\n\nGenerated deconstruct TypeScript workflow.\n", params.Workflow.Name)},
-		{Path: "Dockerfile", Content: "FROM node:22-alpine\nWORKDIR /app\nCOPY package.json ./\nRUN npm install\nCOPY . .\nCMD [\"npm\", \"start\"]\n"},
+		{Path: "README.md", Content: fmt.Sprintf("# %s\n\nGenerated deconstruct TypeScript workflow. Run `npm run serve` to expose the local API wrapper.\n", params.Workflow.Name)},
+		{Path: "Dockerfile", Content: "FROM node:22-alpine\nWORKDIR /app\nCOPY package.json ./\nRUN npm install\nCOPY . .\nCMD [\"npm\", \"run\", \"serve\"]\n"},
 	}
 	return Project{Language: "typescript", Files: files}, nil
 }
 
 func PythonProject(ctx context.Context, store WorkflowStore, blobs *blobstore.Store, params ProjectParams) (Project, error) {
+	action := actionName(params.Workflow)
 	openAPI, err := OpenAPIDocument(ctx, store, params.Workflow, params.ServerURL)
 	if err != nil {
 		return Project{}, err
@@ -95,11 +98,13 @@ func PythonProject(ctx context.Context, store WorkflowStore, blobs *blobstore.St
 		{Path: "pyproject.toml", Content: "[project]\nname = \"generated-action\"\nversion = \"0.1.0\"\ndependencies = [\"httpx\", \"pydantic\", \"fastapi\", \"uvicorn\"]\n"},
 		{Path: "generated_action/__init__.py", Content: "from .workflow import run\n"},
 		{Path: "generated_action/workflow.py", Content: workflowCode},
+		{Path: "generated_action/server.py", Content: pythonServer(action)},
 		{Path: "generated_action/schemas.py", Content: "from pydantic import BaseModel, ConfigDict\n\nclass WorkflowInput(BaseModel):\n    model_config = ConfigDict(extra='allow')\n\nclass WorkflowOutput(BaseModel):\n    model_config = ConfigDict(extra='allow')\n"},
+		{Path: "tests/test_workflow.py", Content: "from generated_action.workflow import run\n\n\ndef test_workflow_callable():\n    assert callable(run)\n"},
 		{Path: "openapi.json", Content: string(openAPIJSON) + "\n"},
 		{Path: ".env.example", Content: "# Add workflow secrets here. Do not commit live tokens.\n"},
-		{Path: "README.md", Content: fmt.Sprintf("# %s\n\nGenerated deconstruct Python workflow.\n", params.Workflow.Name)},
-		{Path: "Dockerfile", Content: "FROM python:3.13-slim\nWORKDIR /app\nCOPY pyproject.toml ./\nRUN pip install .\nCOPY . .\nCMD [\"python\", \"-m\", \"generated_action.workflow\"]\n"},
+		{Path: "README.md", Content: fmt.Sprintf("# %s\n\nGenerated deconstruct Python workflow. Run `uvicorn generated_action.server:app --host 0.0.0.0 --port 8080` to expose the local API wrapper.\n", params.Workflow.Name)},
+		{Path: "Dockerfile", Content: "FROM python:3.13-slim\nWORKDIR /app\nCOPY pyproject.toml ./\nRUN pip install .\nCOPY . .\nCMD [\"uvicorn\", \"generated_action.server:app\", \"--host\", \"0.0.0.0\", \"--port\", \"8080\"]\n"},
 	}
 	return Project{Language: "python", Files: files}, nil
 }
@@ -255,6 +260,52 @@ func pythonWorkflow(ctx context.Context, store WorkflowStore, blobs *blobstore.S
 	}
 	b.WriteString("    return {\"ok\": True, \"input\": input_data}\n")
 	return b.String(), nil
+}
+
+func typescriptServer(action string) string {
+	return fmt.Sprintf(`import http from 'node:http';
+import { %s } from './workflow.js';
+
+const port = Number(process.env.PORT || 8080);
+
+const server = http.createServer(async (req, res) => {
+  if (req.method !== 'POST' || req.url !== '/actions/%s') {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'not_found' }));
+    return;
+  }
+  try {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    const input = chunks.length > 0 ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+    const result = await %s(input);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, result }));
+  } catch (error) {
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+  }
+});
+
+server.listen(port, '0.0.0.0');
+`, action, action, action)
+}
+
+func pythonServer(action string) string {
+	return fmt.Sprintf(`from fastapi import FastAPI, HTTPException
+
+from .workflow import run
+
+app = FastAPI(title="Generated deconstruct workflow")
+
+
+@app.post("/actions/%s")
+def run_action(input_data: dict):
+    try:
+        return {"ok": True, "result": run(input_data)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+`, action)
 }
 
 func exampleFromFirstIncludedStep(ctx context.Context, store WorkflowStore, workflow store.Workflow) (map[string]any, error) {

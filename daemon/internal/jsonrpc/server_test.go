@@ -12,9 +12,12 @@ import (
 
 	"github.com/dhiyaan/deconstruct/daemon/internal/auth"
 	"github.com/dhiyaan/deconstruct/daemon/internal/blobstore"
+	"github.com/dhiyaan/deconstruct/daemon/internal/browsercapture"
 	"github.com/dhiyaan/deconstruct/daemon/internal/certs"
+	"github.com/dhiyaan/deconstruct/daemon/internal/diagnostics"
 	"github.com/dhiyaan/deconstruct/daemon/internal/exporter"
 	"github.com/dhiyaan/deconstruct/daemon/internal/harimport"
+	"github.com/dhiyaan/deconstruct/daemon/internal/mobile"
 	"github.com/dhiyaan/deconstruct/daemon/internal/replay"
 	"github.com/dhiyaan/deconstruct/daemon/internal/store"
 	"github.com/dhiyaan/deconstruct/daemon/internal/systemproxy"
@@ -888,6 +891,95 @@ func TestProxyStartStop(t *testing.T) {
 	status, ok = result.(map[string]any)
 	if !ok || status["enabled"] != true {
 		t.Fatalf("unexpected status: %#v", result)
+	}
+}
+
+func TestBrowserCaptureStatusRPC(t *testing.T) {
+	server := NewServer(Dependencies{Store: testStore(t), Browser: browsercapture.NewManager(testStore(t), nil)})
+	result, rpcErr := server.handle(context.Background(), request{
+		JSONRPC: "2.0",
+		Method:  "browser_capture.status",
+	})
+	if rpcErr != nil {
+		t.Fatalf("unexpected browser status error: %#v", rpcErr)
+	}
+	status, ok := result.(browsercapture.Status)
+	if !ok || status.Running {
+		t.Fatalf("unexpected browser status: %#v", result)
+	}
+}
+
+func TestMobileProtoMaintenanceAndDiagnosticsRPC(t *testing.T) {
+	db := testStore(t)
+	ctx := context.Background()
+	server := NewServer(Dependencies{
+		Store:     db,
+		Version:   "test",
+		DataDir:   t.TempDir(),
+		ProxyAddr: "127.0.0.1:18080",
+		CAPath:    "/tmp/deconstruct-ca.pem",
+	})
+	result, rpcErr := server.handle(ctx, request{JSONRPC: "2.0", Method: "mobile.setup"})
+	if rpcErr != nil {
+		t.Fatalf("unexpected mobile setup error: %#v", rpcErr)
+	}
+	if setup, ok := result.(mobile.Setup); !ok || setup.ProxyPort != 18080 {
+		t.Fatalf("unexpected mobile setup: %#v", result)
+	}
+
+	policyParams, err := json.Marshal(capturePolicySaveParams{Policy: store.CapturePolicy{
+		Scope:   "bundle_id",
+		Matcher: "com.example.NativeApp",
+		Action:  "include",
+		TLSMode: "decrypt",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, rpcErr = server.handle(ctx, request{JSONRPC: "2.0", Method: "local_capture.policies.save", Params: policyParams})
+	if rpcErr != nil {
+		t.Fatalf("unexpected capture policy save error: %#v", rpcErr)
+	}
+	policy, ok := result.(store.CapturePolicy)
+	if !ok || policy.ID == "" || policy.TLSMode != "decrypt" {
+		t.Fatalf("unexpected capture policy: %#v", result)
+	}
+	result, rpcErr = server.handle(ctx, request{JSONRPC: "2.0", Method: "local_capture.policies.list", Params: []byte(`{"scope":"bundle_id"}`)})
+	if rpcErr != nil {
+		t.Fatalf("unexpected capture policy list error: %#v", rpcErr)
+	}
+	if policies, ok := result.([]store.CapturePolicy); !ok || len(policies) != 1 {
+		t.Fatalf("unexpected capture policies: %#v", result)
+	}
+
+	protoParams, err := json.Marshal(map[string]string{
+		"name":   "Demo",
+		"source": "syntax = \"proto3\"; package demo; message Request { string id = 1; } service Demo { rpc Send(Request) returns (Request); }",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, rpcErr = server.handle(ctx, request{JSONRPC: "2.0", Method: "protocol_schemas.import_proto", Params: protoParams})
+	if rpcErr != nil {
+		t.Fatalf("unexpected proto import error: %#v", rpcErr)
+	}
+	schema, ok := result.(store.ProtocolSchema)
+	if !ok || schema.ID == "" || schema.Kind != "protobuf" {
+		t.Fatalf("unexpected proto schema: %#v", result)
+	}
+	result, rpcErr = server.handle(ctx, request{JSONRPC: "2.0", Method: "maintenance.stats"})
+	if rpcErr != nil {
+		t.Fatalf("unexpected stats error: %#v", rpcErr)
+	}
+	if stats, ok := result.(map[string]int64); !ok || stats["protocol_schemas"] != 1 {
+		t.Fatalf("unexpected stats: %#v", result)
+	}
+	result, rpcErr = server.handle(ctx, request{JSONRPC: "2.0", Method: "diagnostics.bundle"})
+	if rpcErr != nil {
+		t.Fatalf("unexpected diagnostics error: %#v", rpcErr)
+	}
+	if bundle, ok := result.(diagnostics.Bundle); !ok || bundle.Path == "" {
+		t.Fatalf("unexpected diagnostics bundle: %#v", result)
 	}
 }
 

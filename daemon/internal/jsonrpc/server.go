@@ -10,15 +10,21 @@ import (
 	"net/url"
 	"reflect"
 	"strconv"
+	"time"
 
 	"github.com/dhiyaan/deconstruct/daemon/internal/auth"
 	"github.com/dhiyaan/deconstruct/daemon/internal/blobstore"
 	"github.com/dhiyaan/deconstruct/daemon/internal/bodyparse"
+	"github.com/dhiyaan/deconstruct/daemon/internal/browsercapture"
 	"github.com/dhiyaan/deconstruct/daemon/internal/certs"
+	"github.com/dhiyaan/deconstruct/daemon/internal/diagnostics"
 	"github.com/dhiyaan/deconstruct/daemon/internal/exporter"
 	"github.com/dhiyaan/deconstruct/daemon/internal/fidelity"
+	"github.com/dhiyaan/deconstruct/daemon/internal/grpcreflect"
 	"github.com/dhiyaan/deconstruct/daemon/internal/harimport"
 	"github.com/dhiyaan/deconstruct/daemon/internal/id"
+	"github.com/dhiyaan/deconstruct/daemon/internal/mobile"
+	"github.com/dhiyaan/deconstruct/daemon/internal/protoschema"
 	"github.com/dhiyaan/deconstruct/daemon/internal/redact"
 	"github.com/dhiyaan/deconstruct/daemon/internal/replay"
 	"github.com/dhiyaan/deconstruct/daemon/internal/store"
@@ -32,6 +38,7 @@ type Dependencies struct {
 	Blobs       *blobstore.Store
 	CA          *certs.Authority
 	Proxy       ProxyController
+	Browser     *browsercapture.Manager
 	SystemProxy *systemproxy.Manager
 	TrustStore  *truststore.Manager
 	Version     string
@@ -184,6 +191,30 @@ type systemProxyParams struct {
 	Port    int    `json:"port,omitempty"`
 }
 
+type browserCaptureStartParams struct {
+	Endpoint    string `json:"endpoint,omitempty"`
+	SessionName string `json:"session_name,omitempty"`
+	Redact      *bool  `json:"redact,omitempty"`
+}
+
+type protocolSchemaListParams struct {
+	Kind  string `json:"kind,omitempty"`
+	Limit int    `json:"limit,omitempty"`
+}
+
+type retentionPruneParams struct {
+	Before string `json:"before"`
+	DryRun bool   `json:"dry_run,omitempty"`
+}
+
+type capturePolicySaveParams struct {
+	Policy store.CapturePolicy `json:"policy"`
+}
+
+type capturePolicyListParams struct {
+	Scope string `json:"scope,omitempty"`
+}
+
 func NewServer(deps Dependencies) *Server {
 	return &Server{deps: deps}
 }
@@ -296,6 +327,77 @@ func (s *Server) handle(ctx context.Context, req request) (any, *rpcError) {
 		}
 		s.deps.Proxy.StopCapture()
 		return s.deps.Proxy.Status(), nil
+	case "browser_capture.status":
+		if s.deps.Browser == nil {
+			return nil, &rpcError{Code: -32000, Message: "browser capture is not configured"}
+		}
+		return s.deps.Browser.Status(), nil
+	case "browser_capture.start":
+		if s.deps.Browser == nil {
+			return nil, &rpcError{Code: -32000, Message: "browser capture is not configured"}
+		}
+		var params browserCaptureStartParams
+		if len(req.Params) > 0 {
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				return nil, &rpcError{Code: -32602, Message: "invalid params"}
+			}
+		}
+		status, err := s.deps.Browser.Start(ctx, browsercapture.StartParams{Endpoint: params.Endpoint, SessionName: params.SessionName, Redact: params.Redact})
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		return status, nil
+	case "browser_capture.stop":
+		if s.deps.Browser == nil {
+			return nil, &rpcError{Code: -32000, Message: "browser capture is not configured"}
+		}
+		return s.deps.Browser.Stop(), nil
+	case "mobile.setup":
+		setup, err := mobile.Build(s.deps.ProxyAddr, s.deps.CAPath)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		return setup, nil
+	case "local_capture.policies.save":
+		var params capturePolicySaveParams
+		if err := json.Unmarshal(req.Params, &params); err != nil || params.Policy.Scope == "" || params.Policy.Matcher == "" || params.Policy.Action == "" {
+			return nil, &rpcError{Code: -32602, Message: "invalid params"}
+		}
+		policy := params.Policy
+		if policy.ID == "" {
+			var err error
+			policy.ID, err = id.New("capture_policy")
+			if err != nil {
+				return nil, &rpcError{Code: -32000, Message: err.Error()}
+			}
+		}
+		if err := s.deps.Store.SaveCapturePolicy(ctx, policy); err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		return policy, nil
+	case "local_capture.policies.list":
+		var params capturePolicyListParams
+		if len(req.Params) > 0 {
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				return nil, &rpcError{Code: -32602, Message: "invalid params"}
+			}
+		}
+		policies, err := s.deps.Store.ListCapturePolicies(ctx, params.Scope)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		return policies, nil
+	case "local_capture.policies.delete":
+		var params struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil || params.ID == "" {
+			return nil, &rpcError{Code: -32602, Message: "invalid params"}
+		}
+		if err := s.deps.Store.DeleteCapturePolicy(ctx, params.ID); err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		return map[string]string{"status": "deleted"}, nil
 	case "sessions.list":
 		sessions, err := s.deps.Store.ListSessions(ctx)
 		if err != nil {
@@ -486,11 +588,55 @@ func (s *Server) handle(ctx context.Context, req request) (any, *rpcError) {
 		if err := json.Unmarshal(req.Params, &params); err != nil || params.FlowID == "" {
 			return nil, &rpcError{Code: -32602, Message: "invalid params"}
 		}
-		diagnostics, err := fidelity.Diagnose(ctx, s.deps.Store, params.FlowID)
+		diag, err := fidelity.Diagnose(ctx, s.deps.Store, params.FlowID)
 		if err != nil {
 			return nil, &rpcError{Code: -32000, Message: err.Error()}
 		}
-		return diagnostics, nil
+		return diag, nil
+	case "protocol_schemas.import_proto":
+		var params protoschema.ImportParams
+		if err := json.Unmarshal(req.Params, &params); err != nil || params.Source == "" {
+			return nil, &rpcError{Code: -32602, Message: "invalid params"}
+		}
+		schema, err := protoschema.Import(ctx, s.deps.Store, params)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		return schema, nil
+	case "protocol_schemas.list":
+		var params protocolSchemaListParams
+		if len(req.Params) > 0 {
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				return nil, &rpcError{Code: -32602, Message: "invalid params"}
+			}
+		}
+		schemas, err := s.deps.Store.ListProtocolSchemas(ctx, params.Kind, params.Limit)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		return schemas, nil
+	case "protocol_schemas.read":
+		var params struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil || params.ID == "" {
+			return nil, &rpcError{Code: -32602, Message: "invalid params"}
+		}
+		schema, err := s.deps.Store.GetProtocolSchema(ctx, params.ID)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		return schema, nil
+	case "grpc.reflection.list_services":
+		var params grpcreflect.Params
+		if err := json.Unmarshal(req.Params, &params); err != nil || params.Target == "" {
+			return nil, &rpcError{Code: -32602, Message: "invalid params"}
+		}
+		result, err := grpcreflect.ListServices(ctx, params)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		return result, nil
 	case "replay.run":
 		if s.deps.Blobs == nil {
 			return nil, &rpcError{Code: -32000, Message: "blob store is not configured"}
@@ -647,6 +793,15 @@ func (s *Server) handle(ctx context.Context, req request) (any, *rpcError) {
 				return nil, &rpcError{Code: -32000, Message: err.Error()}
 			}
 			params.AuthMaterial = material
+			if profile.ChainID != "" {
+				chain, err := s.deps.Store.GetAuthChain(ctx, profile.ChainID)
+				if err != nil {
+					return nil, &rpcError{Code: -32000, Message: err.Error()}
+				}
+				if len(chain.RefreshEndpoints) > 0 {
+					params.AuthRefreshFlowID = chain.RefreshEndpoints[0].FlowID
+				}
+			}
 		}
 		builder := workflowbuilder.NewBuilder(s.deps.Store, s.deps.Blobs)
 		run, err := builder.Run(ctx, workflow, params)
@@ -891,6 +1046,39 @@ func (s *Server) handle(ctx context.Context, req request) (any, *rpcError) {
 			return nil, &rpcError{Code: -32000, Message: err.Error()}
 		}
 		return map[string]string{"status": "restored"}, nil
+	case "maintenance.stats":
+		stats, err := s.deps.Store.Stats(ctx)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		return stats, nil
+	case "maintenance.prune_flows":
+		var params retentionPruneParams
+		if err := json.Unmarshal(req.Params, &params); err != nil || params.Before == "" {
+			return nil, &rpcError{Code: -32602, Message: "invalid params"}
+		}
+		before, err := time.Parse(time.RFC3339Nano, params.Before)
+		if err != nil {
+			before, err = time.Parse(time.RFC3339, params.Before)
+		}
+		if err != nil {
+			return nil, &rpcError{Code: -32602, Message: "invalid before timestamp"}
+		}
+		count, err := s.deps.Store.PruneFlowsBefore(ctx, before, params.DryRun)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		deleted := count
+		if params.DryRun {
+			deleted = 0
+		}
+		return map[string]any{"matched": count, "deleted": deleted, "dry_run": params.DryRun}, nil
+	case "diagnostics.bundle":
+		bundle, err := diagnostics.Create(ctx, s.deps.Store, s.deps.DataDir, s.deps.Version)
+		if err != nil {
+			return nil, &rpcError{Code: -32000, Message: err.Error()}
+		}
+		return bundle, nil
 	default:
 		return nil, &rpcError{Code: -32601, Message: "method not found"}
 	}

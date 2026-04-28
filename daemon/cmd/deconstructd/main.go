@@ -15,6 +15,7 @@ import (
 
 	"github.com/dhiyaan/deconstruct/daemon/internal/auth"
 	"github.com/dhiyaan/deconstruct/daemon/internal/blobstore"
+	"github.com/dhiyaan/deconstruct/daemon/internal/browsercapture"
 	"github.com/dhiyaan/deconstruct/daemon/internal/certs"
 	"github.com/dhiyaan/deconstruct/daemon/internal/config"
 	"github.com/dhiyaan/deconstruct/daemon/internal/jsonrpc"
@@ -97,6 +98,7 @@ func run() error {
 		Blobs:       blobs,
 		CA:          authority,
 		Proxy:       proxyServer,
+		Browser:     browsercapture.NewManager(db, blobs),
 		SystemProxy: systemproxy.New(filepath.Join(*dataDir, "system-proxy"), nil),
 		TrustStore:  truststore.New(nil),
 		Version:     version,
