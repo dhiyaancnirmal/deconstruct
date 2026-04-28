@@ -58,18 +58,29 @@ def run():
 }
 
 func redactedExportInputs(flow store.Flow, requestBody []byte) (map[string]string, []byte, error) {
+	return exportInputs(flow, requestBody, true)
+}
+
+func exportInputs(flow store.Flow, requestBody []byte, redactSecrets bool) (map[string]string, []byte, error) {
 	headers := http.Header{}
 	if len(flow.RequestHeaders) > 0 {
 		if err := json.Unmarshal(flow.RequestHeaders, &headers); err != nil {
 			return nil, nil, fmt.Errorf("decode request headers: %w", err)
 		}
 	}
-	headers = redact.Header(headers)
-	requestBody = redact.Body(requestBody)
+	if redactSecrets {
+		headers = redact.Header(headers)
+		requestBody = redact.Body(requestBody)
+	}
 	output := map[string]string{}
 	keys := make([]string, 0, len(headers))
 	for key := range headers {
-		if strings.EqualFold(key, "Host") || strings.EqualFold(key, "Proxy-Connection") {
+		if strings.HasPrefix(key, ":") ||
+			strings.EqualFold(key, "Host") ||
+			strings.EqualFold(key, "Proxy-Connection") ||
+			strings.EqualFold(key, "Connection") ||
+			strings.EqualFold(key, "Transfer-Encoding") ||
+			strings.EqualFold(key, "Content-Length") {
 			continue
 		}
 		keys = append(keys, key)

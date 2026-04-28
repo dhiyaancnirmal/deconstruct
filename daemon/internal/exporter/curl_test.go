@@ -15,7 +15,7 @@ func TestCurlExport(t *testing.T) {
 	command, err := Curl(store.Flow{
 		Method:         "POST",
 		URL:            "https://example.test/api",
-		RequestHeaders: []byte(`{"Content-Type":["application/json"],"Host":["example.test"]}`),
+		RequestHeaders: []byte(`{":authority":["example.test"],"Content-Type":["application/json"],"Host":["example.test"]}`),
 	}, []byte(`{"name":"dhiyaan"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +54,7 @@ func TestWorkflowProjectExports(t *testing.T) {
 	workflow := store.Workflow{
 		ID:           "workflow_1",
 		Name:         "Create Item",
-		InputSchema:  json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"}}}`),
+		InputSchema:  json.RawMessage(`{"type":"object","properties":{"name":{"type":"string","default":"one"}}}`),
 		OutputSchema: json.RawMessage(`{"type":"object","properties":{"ok":{"type":"boolean"}}}`),
 		Steps: []store.WorkflowStep{{
 			ID:       "step_1",
@@ -70,6 +70,16 @@ func TestWorkflowProjectExports(t *testing.T) {
 	}
 	if len(ts.Files) == 0 || !projectHasFile(ts, "openapi.json") || !projectContains(ts, "[redacted]") {
 		t.Fatalf("unexpected typescript project: %#v", ts)
+	}
+	privateTS, err := TypeScriptProject(ctx, db, blobs, ProjectParams{Workflow: workflow, IncludeSecrets: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !projectContains(privateTS, "Bearer secret") {
+		t.Fatalf("private typescript project did not include requested secrets: %#v", privateTS)
+	}
+	if !projectContains(privateTS, `const defaultInput`) || !projectContains(privateTS, `"name":"one"`) {
+		t.Fatalf("typescript project did not apply workflow defaults: %#v", privateTS)
 	}
 	py, err := PythonProject(ctx, db, blobs, ProjectParams{Workflow: workflow})
 	if err != nil {

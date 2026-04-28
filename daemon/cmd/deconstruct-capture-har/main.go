@@ -115,7 +115,13 @@ func run() error {
 	}
 	defer client.close()
 	flows := map[string]*captureFlow{}
-	go collect(client, flows)
+	var flowsMu sync.Mutex
+	var bodyWG sync.WaitGroup
+	collectDone := make(chan struct{})
+	go func() {
+		defer close(collectDone)
+		collect(client, flows, &flowsMu, &bodyWG)
+	}()
 	if _, err := client.call(ctx, "Network.enable", map[string]any{}); err != nil {
 		return err
 	}
@@ -143,6 +149,10 @@ func run() error {
 	}
 	time.Sleep(*wait)
 	client.close()
+	<-collectDone
+	bodyWG.Wait()
+	flowsMu.Lock()
+	defer flowsMu.Unlock()
 	return writeHAR(*out, flows)
 }
 
@@ -185,10 +195,12 @@ func (c *cdpClient) call(ctx context.Context, method string, params map[string]a
 	id := c.nextID
 	ch := make(chan map[string]any, 1)
 	c.waiters[id] = ch
-	c.mu.Unlock()
 	if err := c.conn.WriteJSON(map[string]any{"id": id, "method": method, "params": params}); err != nil {
+		delete(c.waiters, id)
+		c.mu.Unlock()
 		return nil, err
 	}
+	c.mu.Unlock()
 	select {
 	case response := <-ch:
 		if rawErr, ok := response["error"]; ok {
@@ -227,7 +239,7 @@ func (c *cdpClient) close() {
 	_ = c.conn.Close()
 }
 
-func collect(client *cdpClient, flows map[string]*captureFlow) {
+func collect(client *cdpClient, flows map[string]*captureFlow, flowsMu *sync.Mutex, bodyWG *sync.WaitGroup) {
 	for event := range client.events {
 		method, _ := event["method"].(string)
 		params, _ := event["params"].(map[string]any)
@@ -238,31 +250,69 @@ func collect(client *cdpClient, flows map[string]*captureFlow) {
 		switch method {
 		case "Network.requestWillBeSent":
 			request, _ := params["request"].(map[string]any)
-			flows[requestID] = &captureFlow{
+			flowsMu.Lock()
+			flow := flows[requestID]
+			if flow == nil {
+				flow = &captureFlow{}
+				flows[requestID] = flow
+			}
+			extraHeaders := flow.RequestHeaders
+			*flow = captureFlow{
 				StartedAt:      time.Now().UTC(),
 				Method:         stringValue(request["method"]),
 				URL:            stringValue(request["url"]),
-				RequestHeaders: headers(request["headers"]),
+				RequestHeaders: mergeHeaders(headers(request["headers"]), extraHeaders),
 				RequestBody:    stringValue(request["postData"]),
 			}
-		case "Network.responseReceived":
+			flowsMu.Unlock()
+		case "Network.requestWillBeSentExtraInfo":
+			flowsMu.Lock()
 			flow := flows[requestID]
 			if flow == nil {
+				flow = &captureFlow{StartedAt: time.Now().UTC()}
+				flows[requestID] = flow
+			}
+			flow.RequestHeaders = mergeHeaders(flow.RequestHeaders, headers(params["headers"]))
+			flowsMu.Unlock()
+		case "Network.responseReceived":
+			flowsMu.Lock()
+			flow := flows[requestID]
+			if flow == nil {
+				flowsMu.Unlock()
 				continue
 			}
 			response, _ := params["response"].(map[string]any)
 			flow.Status = int(floatValue(response["status"]))
 			flow.ResponseHeaders = headers(response["headers"])
 			flow.MimeType = stringValue(response["mimeType"])
-		case "Network.loadingFinished":
+			flowsMu.Unlock()
+		case "Network.responseReceivedExtraInfo":
+			flowsMu.Lock()
 			flow := flows[requestID]
 			if flow == nil {
+				flow = &captureFlow{StartedAt: time.Now().UTC()}
+				flows[requestID] = flow
+			}
+			flow.ResponseHeaders = mergeHeaders(flow.ResponseHeaders, headers(params["headers"]))
+			flowsMu.Unlock()
+		case "Network.loadingFinished":
+			flowsMu.Lock()
+			flow := flows[requestID]
+			if flow == nil {
+				flowsMu.Unlock()
 				continue
 			}
 			flow.TimeMS = time.Since(flow.StartedAt).Seconds() * 1000
-			body, encoding := responseBody(context.Background(), client, requestID)
-			flow.ResponseBody = body
-			flow.Encoding = encoding
+			flowsMu.Unlock()
+			bodyWG.Add(1)
+			go func(flow *captureFlow, requestID string) {
+				defer bodyWG.Done()
+				body, encoding := responseBody(context.Background(), client, requestID)
+				flowsMu.Lock()
+				flow.ResponseBody = body
+				flow.Encoding = encoding
+				flowsMu.Unlock()
+			}(flow, requestID)
 		}
 	}
 }
@@ -339,6 +389,20 @@ func headers(value any) map[string]string {
 	object, _ := value.(map[string]any)
 	for key, raw := range object {
 		out[key] = fmt.Sprint(raw)
+	}
+	return out
+}
+
+func mergeHeaders(base, extra map[string]string) map[string]string {
+	if len(base) == 0 && len(extra) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	for key, value := range base {
+		out[key] = value
+	}
+	for key, value := range extra {
+		out[key] = value
 	}
 	return out
 }

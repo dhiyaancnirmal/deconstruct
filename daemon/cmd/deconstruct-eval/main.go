@@ -26,6 +26,7 @@ func run() error {
 	name := flag.String("name", "", "scenario name")
 	replay := flag.Bool("replay", false, "replay compiled workflow after import")
 	redact := flag.Bool("redact", false, "redact secrets before compiler evaluation")
+	includeSecrets := flag.Bool("include-secrets", false, "include captured secrets in generated artifacts; only use with private output directories")
 	serverURL := flag.String("server-url", "", "server URL for generated OpenAPI document")
 	flag.Parse()
 	if *harPath == "" {
@@ -46,12 +47,13 @@ func run() error {
 		return err
 	}
 	report, err := eval.RunHAR(context.Background(), db, blobs, eval.HAREvalParams{
-		Name:      *name,
-		HARPath:   *harPath,
-		OutputDir: *outDir,
-		Replay:    *replay,
-		Redact:    *redact,
-		ServerURL: *serverURL,
+		Name:           *name,
+		HARPath:        *harPath,
+		OutputDir:      *outDir,
+		Replay:         *replay,
+		Redact:         *redact,
+		ServerURL:      *serverURL,
+		IncludeSecrets: *includeSecrets,
 	})
 	if err != nil {
 		return err

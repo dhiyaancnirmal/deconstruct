@@ -17,12 +17,13 @@ import (
 )
 
 type HAREvalParams struct {
-	Name      string `json:"name,omitempty"`
-	HARPath   string `json:"har_path,omitempty"`
-	OutputDir string `json:"output_dir,omitempty"`
-	Replay    bool   `json:"replay,omitempty"`
-	Redact    bool   `json:"redact,omitempty"`
-	ServerURL string `json:"server_url,omitempty"`
+	Name           string `json:"name,omitempty"`
+	HARPath        string `json:"har_path,omitempty"`
+	OutputDir      string `json:"output_dir,omitempty"`
+	Replay         bool   `json:"replay,omitempty"`
+	Redact         bool   `json:"redact,omitempty"`
+	ServerURL      string `json:"server_url,omitempty"`
+	IncludeSecrets bool   `json:"include_secrets,omitempty"`
 }
 
 type HAREvalReport struct {
@@ -92,11 +93,11 @@ func RunHAR(ctx context.Context, db *store.Store, blobs *blobstore.Store, params
 	if report.IncludedSteps == 0 {
 		report.Failures = append(report.Failures, "compiler included zero executable steps")
 	}
-	tsProject, err := exporter.TypeScriptProject(ctx, db, blobs, exporter.ProjectParams{Workflow: workflow, Language: "typescript", ServerURL: params.ServerURL})
+	tsProject, err := exporter.TypeScriptProject(ctx, db, blobs, exporter.ProjectParams{Workflow: workflow, Language: "typescript", ServerURL: params.ServerURL, IncludeSecrets: params.IncludeSecrets})
 	if err != nil {
 		return report, err
 	}
-	pyProject, err := exporter.PythonProject(ctx, db, blobs, exporter.ProjectParams{Workflow: workflow, Language: "python", ServerURL: params.ServerURL})
+	pyProject, err := exporter.PythonProject(ctx, db, blobs, exporter.ProjectParams{Workflow: workflow, Language: "python", ServerURL: params.ServerURL, IncludeSecrets: params.IncludeSecrets})
 	if err != nil {
 		return report, err
 	}

@@ -18,9 +18,10 @@ type WorkflowStore interface {
 }
 
 type ProjectParams struct {
-	Workflow  store.Workflow `json:"workflow"`
-	Language  string         `json:"language"`
-	ServerURL string         `json:"server_url,omitempty"`
+	Workflow       store.Workflow `json:"workflow"`
+	Language       string         `json:"language"`
+	ServerURL      string         `json:"server_url,omitempty"`
+	IncludeSecrets bool           `json:"include_secrets,omitempty"`
 }
 
 type ProjectFile struct {
@@ -65,7 +66,7 @@ func TypeScriptProject(ctx context.Context, store WorkflowStore, blobs *blobstor
 		return Project{}, err
 	}
 	openAPIJSON, _ := json.MarshalIndent(openAPI, "", "  ")
-	workflowCode, err := typescriptWorkflow(ctx, store, blobs, params.Workflow)
+	workflowCode, err := typescriptWorkflow(ctx, store, blobs, params.Workflow, params.IncludeSecrets)
 	if err != nil {
 		return Project{}, err
 	}
@@ -91,7 +92,7 @@ func PythonProject(ctx context.Context, store WorkflowStore, blobs *blobstore.St
 		return Project{}, err
 	}
 	openAPIJSON, _ := json.MarshalIndent(openAPI, "", "  ")
-	workflowCode, err := pythonWorkflow(ctx, store, blobs, params.Workflow)
+	workflowCode, err := pythonWorkflow(ctx, store, blobs, params.Workflow, params.IncludeSecrets)
 	if err != nil {
 		return Project{}, err
 	}
@@ -175,7 +176,7 @@ func Postman(ctx context.Context, store WorkflowStore, blobs *blobstore.Store, w
 		if blobs != nil && flow.RequestBlob != "" {
 			body, _ = blobs.Get(flow.RequestBlob)
 		}
-		headers, redactedBody, err := redactedExportInputs(flow, body)
+		headers, redactedBody, err := exportInputs(flow, body, true)
 		if err != nil {
 			return PostmanCollection{}, err
 		}
@@ -203,11 +204,13 @@ func Postman(ctx context.Context, store WorkflowStore, blobs *blobstore.Store, w
 	}, nil
 }
 
-func typescriptWorkflow(ctx context.Context, store WorkflowStore, blobs *blobstore.Store, workflow store.Workflow) (string, error) {
+func typescriptWorkflow(ctx context.Context, store WorkflowStore, blobs *blobstore.Store, workflow store.Workflow, includeSecrets bool) (string, error) {
 	var b strings.Builder
+	defaultJSON, _ := json.Marshal(schemaDefaultValues(workflow.InputSchema))
 	fmt.Fprintf(&b, `import { inputSchema } from './schemas.js';
 
 type StepOutputs = Record<string, Record<string, unknown>>;
+const defaultInput: Record<string, unknown> = %s;
 
 function readPath(value: unknown, path: string): unknown {
   if (path === '$') return value;
@@ -236,9 +239,10 @@ function bindHeaders(headers: Record<string, string>, input: Record<string, unkn
 }
 
 export async function %s(input: unknown) {
-  const parsed = inputSchema.parse(input);
+  const parsed = { ...defaultInput, ...inputSchema.parse(input) };
   const steps: StepOutputs = {};
-`, actionName(workflow))
+  let lastResult: unknown = undefined;
+`, string(defaultJSON), actionName(workflow))
 	for index, step := range workflow.Steps {
 		if !step.Included {
 			continue
@@ -247,7 +251,7 @@ export async function %s(input: unknown) {
 		if err != nil {
 			return "", err
 		}
-		compiled, err := compileStep(blobs, flow, step)
+		compiled, err := compileStep(blobs, flow, step, includeSecrets)
 		if err != nil {
 			return "", err
 		}
@@ -261,11 +265,12 @@ export async function %s(input: unknown) {
 		fmt.Fprintf(&b, "  const step%d = await fetch(%q, { method: %q, headers: bindHeaders(%s, parsed, steps), body: step%dBody });\n", index+1, compiled.URL, compiled.Method, string(headerJSON), index+1)
 		fmt.Fprintf(&b, "  if (!%s.includes(step%d.status)) throw new Error(%q + step%d.status);\n", string(statusJSON), index+1, step.ID+" failed: ", index+1)
 		fmt.Fprintf(&b, "  const step%dText = await step%d.text();\n  let step%dJSON: unknown = undefined;\n  try { step%dJSON = step%dText ? JSON.parse(step%dText) : undefined; } catch {}\n", index+1, index+1, index+1, index+1, index+1, index+1)
+		fmt.Fprintf(&b, "  lastResult = step%dJSON === undefined ? step%dText : step%dJSON;\n", index+1, index+1, index+1)
 		fmt.Fprintf(&b, "  for (const path of %s) if (readPath(step%dJSON, path) === undefined) throw new Error(%q + path);\n", string(jsonPathJSON), index+1, step.ID+" missing JSON path: ")
 		fmt.Fprintf(&b, "  for (const needle of %s) if (!step%dText.includes(needle)) throw new Error(%q + needle);\n", string(bodyContainsJSON), index+1, step.ID+" missing body text: ")
 		fmt.Fprintf(&b, "  steps[%q] = Object.fromEntries(Object.entries(%s).map(([key, path]) => [key, readPath(step%dJSON, path as string)]));\n", step.ID, string(extractJSON), index+1)
 	}
-	b.WriteString("  return { ok: true, input: parsed };\n}\n")
+	b.WriteString("  return { ok: true, input: parsed, result: lastResult };\n}\n")
 	return b.String(), nil
 }
 
@@ -277,13 +282,13 @@ type compiledStep struct {
 	Statuses []int
 }
 
-func compileStep(blobs *blobstore.Store, flow store.Flow, step store.WorkflowStep) (compiledStep, error) {
+func compileStep(blobs *blobstore.Store, flow store.Flow, step store.WorkflowStep, includeSecrets bool) (compiledStep, error) {
 	body := []byte{}
 	if blobs != nil && flow.RequestBlob != "" {
 		raw, _ := blobs.Get(flow.RequestBlob)
 		body = raw
 	}
-	headers, redactedBody, err := redactedExportInputs(flow, body)
+	headers, redactedBody, err := exportInputs(flow, body, !includeSecrets)
 	if err != nil {
 		return compiledStep{}, err
 	}
@@ -351,9 +356,10 @@ func stringSlice(values []string) []string {
 	return values
 }
 
-func pythonWorkflow(ctx context.Context, store WorkflowStore, blobs *blobstore.Store, workflow store.Workflow) (string, error) {
+func pythonWorkflow(ctx context.Context, store WorkflowStore, blobs *blobstore.Store, workflow store.Workflow, includeSecrets bool) (string, error) {
 	var b strings.Builder
-	b.WriteString("import httpx\n\n\ndef run(input_data=None):\n    input_data = input_data or {}\n")
+	defaultJSON, _ := json.Marshal(schemaDefaultValues(workflow.InputSchema))
+	fmt.Fprintf(&b, "import httpx\n\n\nDEFAULT_INPUT = %s\n\n\ndef run(input_data=None):\n    input_data = {**DEFAULT_INPUT, **(input_data or {})}\n    last_result = None\n", string(defaultJSON))
 	for _, step := range workflow.Steps {
 		if !step.Included {
 			continue
@@ -366,7 +372,7 @@ func pythonWorkflow(ctx context.Context, store WorkflowStore, blobs *blobstore.S
 		if blobs != nil && flow.RequestBlob != "" {
 			body, _ = blobs.Get(flow.RequestBlob)
 		}
-		headers, redactedBody, err := redactedExportInputs(flow, body)
+		headers, redactedBody, err := exportInputs(flow, body, !includeSecrets)
 		if err != nil {
 			return "", err
 		}
@@ -374,8 +380,9 @@ func pythonWorkflow(ctx context.Context, store WorkflowStore, blobs *blobstore.S
 		bodyJSON, _ := json.Marshal(string(redactedBody))
 		fmt.Fprintf(&b, "    response = httpx.request(%q, %q, headers=%s, content=%s, timeout=60)\n", flow.Method, flow.URL, string(headerJSON), string(bodyJSON))
 		fmt.Fprintf(&b, "    response.raise_for_status()\n")
+		b.WriteString("    try:\n        last_result = response.json()\n    except ValueError:\n        last_result = response.text\n")
 	}
-	b.WriteString("    return {\"ok\": True, \"input\": input_data}\n")
+	b.WriteString("    return {\"ok\": True, \"input\": input_data, \"result\": last_result}\n")
 	return b.String(), nil
 }
 
@@ -453,6 +460,22 @@ func rawSchema(data json.RawMessage) any {
 		return map[string]any{"type": "object", "properties": map[string]any{}}
 	}
 	return decoded
+}
+
+func schemaDefaultValues(data json.RawMessage) map[string]any {
+	var decoded struct {
+		Properties map[string]map[string]any `json:"properties"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return map[string]any{}
+	}
+	defaults := map[string]any{}
+	for key, property := range decoded.Properties {
+		if value, ok := property["default"]; ok {
+			defaults[key] = value
+		}
+	}
+	return defaults
 }
 
 func actionName(workflow store.Workflow) string {
